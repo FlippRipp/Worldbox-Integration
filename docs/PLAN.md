@@ -10,8 +10,10 @@ This repo (`FlippRipp/Worldbox-Sex-Toy-Integration-`) will hold a haptics module
 1. Two device backends: **Lovense direct local API** (preferred, more stable) + **Intiface Central / buttplug.io** websocket (broad compatibility). Both can run simultaneously.
 2. Primary trigger: **keyword detection during LLM token streaming** — react in real time as prose streams, with per-keyword strength and pattern (latched state, no durations — user's explicit choice).
 3. Manual control panel + safety: status widget, test buzz, master intensity cap, instant stop.
-4. **Semantic triggers via OpenRouter** (user-confirmed): a small instruct LLM classifies streamed prose near-real-time, fixing keyword imprecision (negation, memories, paraphrase). **`trigger_mode: "hybrid"` is the default** — keywords react instantly, semantic verdicts override with authority ~1 s later. Degrades to keywords-only when no API key is configured.
+4. **Semantic triggers via the app's LLM stack** (user-confirmed; originally specced against OpenRouter directly, redesigned after source inspection — the app already routes module LLM calls): a small instruct LLM classifies streamed prose near-real-time, fixing keyword imprecision (negation, memories, paraphrase). Default model is the provider config's `module_fast_model` via `sdk.llm`; a **custom model override just for this module** is a confirmed requirement. **`trigger_mode: "hybrid"` is the default** — keywords react instantly, semantic verdicts override with authority ~1 s later. Degrades to keywords-only when no LLM is configured or calls fail.
 5. **Extend WorldboxAI's module API** — specced as a standalone implementation request (`docs/WORLDBOXAI_HOOKS_REQUEST.md`) that **Filip implements in WorldboxAI himself**; this project never pushes to that repo (user's choice, replacing the earlier plan to develop the hooks on a WorldboxAI branch). The toy module **requires** these hooks — no `emit_token` monkey-patch fallback (user's explicit choice). On an older WorldboxAI checkout the module loads but disables itself with a clear "update WorldboxAI" status message.
+6. **Settings home as a main-menu tab** (user-confirmed): all module settings live in the Toy Studio full-screen mode, which surfaces automatically as a main-menu card (module `modes` → `module:{modId}:{modeId}`, rendered by `MainMenu.jsx:66-74`), with polished UI matching the app's look. Trigger rules must be user-definable with good shipped defaults.
+7. **Android/Termux is a first-class target** (`docs/SETUP_ANDROID_TERMUX.md` in WorldboxAI): the module stays pure-Python over `httpx`/`websockets` (both in the documented Termux install) and all UI must be touch-first.
 
 ## Architecture
 
@@ -20,7 +22,7 @@ Single asyncio update loop (~10 Hz) owns all device writes. Trigger producers (k
 ```
 storyteller ─► on_stream_token (new core hook) ─► KeywordScanner ────► VibeState
                                   └─► SemanticClassifier (async, ─────►   │
-                                      OpenRouter; hybrid override)        │ 10 Hz loop
+                                      sdk.llm; hybrid override)           │ 10 Hz loop
 turn cancel ─► on_turn_stopped (new core hook) ─► instant stop            │
 REST router + /toys command + widgets ─────────────────────────►  DeviceManager
                                                          ┌──────────┴──────────┐
@@ -64,23 +66,29 @@ Module-side hook duties: `on_stream_token` → `KeywordScanner.feed()` (sync, O(
 Fixes keyword imprecision: negation ("he didn't touch her"), memories/dialogue-about, euphemism and paraphrase all classify correctly; a calm verdict acts like a stop-word, so scene wind-downs are caught without keyword curation. Doesn't change pacing — state still evolves at generation speed.
 
 - **Chunking**: buffers `on_stream_token` text at sentence boundaries; on each completed sentence (min 1) classifies a rolling window of the last ~`window_chars` (default 600) of prose. Max one call in flight — if busy, the next completed sentence classifies the *latest* window (natural rate limit, no queue growth). Calls run as fire-and-forget tasks off the token hot path; the hook itself stays sync and cheap.
-- **OpenRouter backend**: `POST {base_url}/chat/completions` (default `https://openrouter.ai/api/v1`, overridable for tests/proxies) via the shared `httpx.AsyncClient`; user-configurable `model` — **pick default at implementation: verify candidate models are permissive with explicit prose and reliable at JSON output**; temperature 0; system prompt lists the *user's own categories from rules.json* (shared vocabulary with the keyword engine) and demands strict JSON `{"category": …, "strength": 0-100, "pattern": …}` or `{"no_change": true}`.
+- **LLM access via the app's stack** (replaces the earlier direct-OpenRouter design — the app already routes module LLM calls): default path is `sdk.llm.generate(prompt, model_preference="fastest")` (`backend/sdk/llm_bridge.py`), which resolves the provider config's `module_fast_model` at call time — provider-agnostic (OpenRouter or Gemini), inherits the app's key/retries/inspector logging, has a mock mode for tests, and fail-quiets to `""`. **Custom model just for this module** (user requirement): when `semantic.model_override` is set, call `engine.llm.simple_completion(messages, model=override)` on the engine service handle the module already holds — pragmatic use of an internal API; the official long-term path (an optional `model` param on the bridge) is proposed as a nice-to-have in `docs/WORLDBOXAI_HOOKS_REQUEST.md`. Prompt: lists the *user's own categories from rules.json* (shared vocabulary with the keyword engine) and demands strict JSON `{"category": …, "strength": 0-100, "pattern": …}` or `{"no_change": true}`. **Docs/UI note: semantic quality depends on the chosen model being permissive with explicit prose — refusals fail-quiet into keywords-only.**
 - **Hybrid precedence** (`trigger_mode: "hybrid"`, the default): keyword matches apply to `VibeState` instantly (the twitch reaction); a semantic verdict arriving ~1 s later **overrides** whatever keywords set (authoritative-latest-wins); `no_change` leaves state untouched. `"keywords"` and `"semantic"` modes run one producer alone. Slew smoothing makes semantic corrections ramp, not jump.
 - **Fail-quiet**: timeout (`timeout_s`, default 4) wrapped in `wait_for`; HTTP errors, refusals, malformed JSON → keep current state, record to `last_error`, back off 30 s after 3 consecutive failures. Trigger path must never raise into the token hook or block streaming.
-- **Degradation**: no `api_key` (or backend error state) → hybrid runs keywords-only and `/status` + sidebar show "semantic: no API key" / last error. Backend is a small interface (`classify(window) -> verdict`) so a local zero-shot backend can be added later without touching the engine.
-- **Privacy/cost note for README**: in hybrid/semantic mode, story prose is sent to OpenRouter and its upstream provider; the key is stored plaintext in the module's global `config.json`. Typical cost: well under a cent per turn with a small model.
+- **Degradation**: no configured LLM provider, persistent errors, or refusals → hybrid runs keywords-only and `/status` + sidebar show the reason. Backend is a small interface (`classify(window) -> verdict`) so other backends (e.g. local zero-shot) can be added later without touching the engine.
+- **Privacy/cost note for README**: in hybrid/semantic mode, prose excerpts go to the configured LLM provider — the same trust domain as the storyteller, which already sends the full story. Typical cost: well under a cent per turn with a fast model.
 
 ## Module surface
 
-**manifest.json** (validated against registry.py:181-344): id `wb_toy_link`, `consumes: {state:["turn"], module_data:[], module_configs:[], world_data:false}`, `produces` all false; `ui_slots:["slot_sidebar"]`; `commands: {"/toys":"on_command_toys"}` (stop | on | off | test [0-100] | status); `settings_schema`: `enabled` toggle + `master_cap` slider (default 70); `modes:[{id:"toy-studio", screen:"ui/ToyStudio.jsx"}]`.
+**manifest.json** (validated against registry.py:181-344): id `wb_toy_link`, `consumes: {state:["turn"], module_data:[], module_configs:[], world_data:false}`, `produces` all false; `ui_slots:["slot_sidebar"]`; `commands: {"/toys":"on_command_toys"}` (stop | on | off | test [0-100] | status); `settings_schema`: `enabled` toggle + `master_cap` slider (default 70); `modes:[{id:"toy-studio", screen:"ui/ToyStudio.jsx", label:"Toy Studio", icon:"🎛️", description:"Devices, triggers, and haptics settings"}]` — `MainMenu.jsx:66-74` turns this into a main-menu card automatically.
 
 **Router** at `/api/modules/wb_toy_link/*`: `GET /status` (backend states, devices, current level, active effects, trigger mode + semantic state/last verdict, last errors), `POST /stop`, `POST /toggle` (flips `vibe_on`, returns new state; `/status` includes it), `POST /test`, `GET|PUT /config`, `GET|PUT /rules`, `POST /backends/{name}/connect|disconnect`.
 
 **Frontend** (widget imports limited to whitelist in moduleLoader.js — use plain `fetch` like wb_image_gen/widget.jsx):
 - `widget.jsx` (sidebar): polls `/status` @1.5 s — per-backend status dot, live intensity bar, prominent STOP, test buzz, vibe on/off state.
-- **Floating toggle** (rendered from `widget.jsx`): a small draggable stop/play button floating over the whole app that flips `vibe_on` via `POST /toggle`. Drag with pointer events; a tap (movement under ~5 px) toggles, a drag repositions; position persisted to `localStorage`. Render via `ReactDOM.createPortal(…, document.body)` so it escapes the sidebar. **Verify at implementation: `react-dom`/portal availability in moduleLoader.js's import whitelist, and that the sidebar widget stays mounted when the sidebar is collapsed** — fallback is `position: fixed` inside the widget tree (beware ancestor `transform` creating a containing block) or, if the widget unmounts, asking for a core overlay slot is out of scope for v1. Button shows current state (playing / muted) and the live level.
+- **Floating toggle** (rendered from `widget.jsx`): a small draggable stop/play button floating over the whole app that flips `vibe_on` via `POST /toggle`. Drag with pointer events + `touch-action: none` (phone play is first-class); a tap (movement under ~8 px, forgiving for touch) toggles, a drag repositions; hit target ≥44 px; position persisted via the moduleLoader **`storage` builtin** (profile-namespaced — not `window.localStorage`). Render via `ReactDOM.createPortal(…, document.body)` — **confirmed available** (`react-dom` is in moduleLoader.js `BUILTINS`) and **required**: the mobile drawer animates with a CSS transform that would capture `position: fixed`. Gotcha (verified in `Sidebar.jsx`): sidebar content renders in two places — a desktop `<aside>` (CSS-hidden on mobile but always mounted) and the mobile drawer when open — so the widget can mount twice; the floating button needs a module-level singleton guard (first mount wins). The always-mounted aside means the button exists even with the drawer closed. Button shows current state (playing / muted) and the live level.
 - `widget_settings.jsx`: per-story enabled/cap via `{config, onSaveConfig}`.
-- `ui/ToyStudio.jsx` (mode screen): Lovense IP + Intiface URL entry, connect buttons, device list; keyword-rule table editor (keywords, category, strength, pattern, enabled) + category-defaults editor; semantic settings (trigger-mode selector, OpenRouter API key + model, status of last classification); saves via `PUT /rules|/config`, hot-applies via RuleSet version bump.
+- `ui/ToyStudio.jsx` (mode screen — **the settings home**, reached from its main-menu card): one polished, touch-first screen matching the app's look (dark gradient background, `rounded-xl` bordered cards, purple accents — same conventions as `MainMenu.jsx`/Settings). moduleLoader compiles multi-file modules, so split sections into `ui/toystudio/*.jsx`. Sections:
+  - **Devices** — Lovense IP + Intiface URL entry, connect/disconnect buttons, live device list with status, test buzz.
+  - **Triggers** — trigger-mode selector (hybrid / keywords / semantic); keyword-rule table editor (keywords, category, strength, pattern, enabled); category-defaults editor; **tester box**: paste a paragraph → see which rules match and what the semantic verdict returns before it ever touches a device.
+  - **Model** — choice between "app default" (`module_fast_model`, shown by name) and a custom model ID used only by this module (`semantic.model_override`), with a hint that the model must be permissive with explicit prose, plus last-classification status/error.
+  - **General** — global master cap, `ramp_ms`, `stop_on_turn_end`.
+
+  Saves via `PUT /rules|/config`, hot-applies via RuleSet version bump. Per-story enable/cap stays in `widget_settings.jsx` (story-scoped, not global).
 
 **Config persistence**: app-global (device addresses, rules) as JSON under `services["global_data_dir"]/wb_toy_link/` (`config.json`, `rules.json` — schemas below); per-story toggle/cap in `module_configs`.
 
@@ -90,9 +98,7 @@ Fixes keyword imprecision: negation ("he didn't touch her"), memories/dialogue-a
   "buttplug": { "enabled": false, "url": "ws://127.0.0.1:12345" },
   "master_cap_global": 100, "ramp_ms": 500, "stop_on_turn_end": false, "tick_hz": 10,
   "trigger_mode": "hybrid",
-  "semantic": { "backend": "openrouter", "api_key": "", "model": "",
-                "base_url": "https://openrouter.ai/api/v1",
-                "window_chars": 600, "timeout_s": 4 } }
+  "semantic": { "model_override": "", "window_chars": 600, "timeout_s": 4 } }
 // rules.json — null field = inherit from category; no durations (latched strength+pattern)
 { "categories": { "gentle":  {"strength":30, "pattern":"constant"},
                   "intense": {"strength":85, "pattern":"pulse", "pulse_on_ms":400, "pulse_off_ms":250},
@@ -101,7 +107,7 @@ Fixes keyword imprecision: negation ("he didn't touch her"), memories/dialogue-a
               "strength":null,"pattern":null} ] }
 ```
 
-Ship a sensible default rules.json (a handful of gentle/moderate/intense example rules the user edits in Toy Studio).
+Ship polished defaults (user requirement — good out-of-box behavior without editing anything): a curated rules.json spanning gentle/moderate/intense/calm categories with sensible strengths/patterns and a real set of stop-words; defaults are what most users will run, so they get tuned during real-hardware verification, not improvised.
 
 ## Repo layout
 
@@ -116,7 +122,7 @@ wb_toy_link/
                         #   buttplug_client.py, config_store.py
   widget.jsx  widget_settings.jsx  ui/ToyStudio.jsx
 tests/                  # standalone, no WorldboxAI needed
-  test_keyword_engine.py  test_semantic_engine.py (httpx.MockTransport fake OpenRouter)
+  test_keyword_engine.py  test_semantic_engine.py (stub sdk.llm / engine.llm fakes)
   test_patterns.py  test_buttplug_client.py (fake ws server)
   test_lovense_client.py (httpx.MockTransport)  test_hooks_contract.py (stub services/engine:
                           # feature detection, hook dispatch → scanner/effects, missing-feature disable)
@@ -132,15 +138,15 @@ tools/dev_console.py    # REPL: type prose, watch levels / drive real devices sa
 5. `buttplug_client.py` + fake-server test (handshake order, Id/future matching, ScalarCmd framing, reconnect after drop).
 6. `lovense_client.py` + MockTransport test (command bodies, 0–20 mapping, timeSec safety).
 7. `device_manager.py` + loop test with fake clients (change-threshold sends, keepalive, zero-once, slew ramping toward new targets, kill-switch immediacy bypassing the slew, `vibe_on` gate: off = immediate zero while latched state keeps updating, on = ramp back to current target).
-8. `semantic_engine.py` + MockTransport tests (fake OpenRouter: sentence-boundary cadence, single in-flight/latest-window behavior, JSON verdict parsing incl. `no_change`, hybrid override of keyword-set state, fail-quiet on error/refusal/malformed JSON, backoff after consecutive failures, keywords-only degradation without api_key).
+8. `semantic_engine.py` + tests against stub `sdk.llm`/`engine.llm` fakes (sentence-boundary cadence, single in-flight/latest-window behavior, JSON verdict parsing incl. `no_change`, hybrid override of keyword-set state, fail-quiet on error/refusal/malformed output, backoff after consecutive failures, keywords-only degradation with no LLM configured, `model_override` routing to `engine.llm.simple_completion`).
 9. `backend.py`: feature detection (require official hooks; disable with clear status if absent), `on_stream_token`/`on_turn_start`/`on_turn_stopped` implementations fanning tokens to keyword scanner + semantic chunker per `trigger_mode`, `/toys` command, router, gating + `test_hooks_contract.py`.
-10. Frontend: `widget.jsx` (incl. floating toggle — resolve the portal/whitelist verify item first), `widget_settings.jsx`, `ui/ToyStudio.jsx`.
-11. Docs + installers; default rules.json. README states the module requires a WorldboxAI build with the stream-hook module API (see `docs/WORLDBOXAI_HOOKS_REQUEST.md`), and documents the semantic mode's privacy/cost note + OpenRouter key setup.
+10. Frontend: `widget.jsx` (incl. floating toggle — portal + singleton guard + touch handling per spec), `widget_settings.jsx`, `ui/ToyStudio.jsx` + `ui/toystudio/*.jsx` section components (settings home).
+11. Docs + installers; default rules.json. README states the module requires a WorldboxAI build with the stream-hook module API (see `docs/WORLDBOXAI_HOOKS_REQUEST.md`), and documents the semantic mode's privacy/cost note + model guidance (app default vs per-module override; permissive-model requirement).
 
 ## Verification
 
 - `pip install -r requirements-dev.txt && pytest` — green standalone (no WorldboxAI checkout needed).
-- Integration (once Filip's hook implementation exists): symlink `wb_toy_link` into a WorldboxAI checkout that implements the hooks request, start the backend (`python main.py` after `pip install -r requirements.txt`), confirm module loads and reports "official hooks" mode in `/status`, `curl localhost:8321/api/modules/wb_toy_link/status` works, and a scripted fake-token feed (or a fake ws client against a locally-run Intiface stub from the test suite) shows effects firing while streaming; point `semantic.base_url` at a local fake-OpenRouter stub to verify the hybrid override end-to-end (keyword sets state, semantic verdict corrects it). Also check against an unmodified WorldboxAI checkout: module loads but reports "requires updated WorldboxAI" and drives nothing.
-- Real hardware (user, post-merge): Intiface Central simulated device → keyword mid-stream buzzes <300 ms after the word renders; STOP zeroes instantly; floating toggle off silences immediately and toggle on ramps back to the story's current intensity/pattern; with a real OpenRouter key, a false-positive keyword (e.g. a negated phrase) gets corrected by the semantic verdict within a couple of seconds; Lovense Remote Game Mode on-LAN → enter IP in Toy Studio, GetToys populates, test buzz, confirm exact API envelope (flagged verify-live item).
+- Integration (once Filip's hook implementation exists): symlink `wb_toy_link` into a WorldboxAI checkout that implements the hooks request, start the backend (`python main.py` after `pip install -r requirements.txt`), confirm module loads and reports "official hooks" mode in `/status`, `curl localhost:8321/api/modules/wb_toy_link/status` works, and a scripted fake-token feed (or a fake ws client against a locally-run Intiface stub from the test suite) shows effects firing while streaming; with a stubbed `sdk.llm`/`engine.llm` returning scripted verdicts, verify the hybrid override end-to-end (keyword sets state, semantic verdict corrects it). Also check against an unmodified WorldboxAI checkout: module loads but reports "requires updated WorldboxAI" and drives nothing.
+- Real hardware (user, post-merge): Intiface Central simulated device → keyword mid-stream buzzes <300 ms after the word renders; STOP zeroes instantly; floating toggle off silences immediately and toggle on ramps back to the story's current intensity/pattern; with a real provider configured, a false-positive keyword (e.g. a negated phrase) gets corrected by the semantic verdict within a couple of seconds; on Termux, Lovense Remote and the backend on the *same* phone: confirm Game-Mode localhost reachability (verify-live item); Lovense Remote Game Mode on-LAN → enter IP in Toy Studio, GetToys populates, test buzz, confirm exact API envelope (flagged verify-live item).
 
 Commit and push: this repo's work to the session's designated branch, then fast-forward `main` (per CLAUDE.md). No pushes to FlippRipp/WorldboxAI — core changes go through `docs/WORLDBOXAI_HOOKS_REQUEST.md`.

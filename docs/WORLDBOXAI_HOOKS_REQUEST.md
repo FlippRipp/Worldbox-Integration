@@ -95,6 +95,18 @@ LLM):
 
 Suite must stay green: `python -m pytest test_module_contract.py`.
 
+## Optional nice-to-have: LLMBridge model override
+
+Separate from the hooks, low priority, take it or leave it: an optional
+`model: str | None = None` parameter on `LLMBridge.generate` that, when set,
+bypasses the preference slots and uses the given model id — letting a module
+carry a module-scoped model override officially. The haptics module wants a
+user-picked custom model for its semantic classifier; without this it falls
+back to calling `engine.llm.simple_completion(messages, model=...)` directly
+on the engine service handle, which works but leans on an internal API. If
+implemented, add `"llm_model_override"` to `MODULE_API_FEATURES` so modules
+can detect it.
+
 ## Reference facts (from prior source inspection)
 
 - One `WorldBoxSDK` per `EngineGraph` (`graph.py:43`); engine created once at
