@@ -168,6 +168,9 @@ async def test_prompt_lists_user_categories_and_window():
     assert '"gentle": strength 30' in prompt
     assert '"calm": strength 0 (this means: stop / wind down)' in prompt
     assert "Some prose here." in prompt
+    # Anti-overthinking directive for reasoning models: pinned so it isn't
+    # lost in a prompt rewrite.
+    assert "Do not reason step by step" in prompt
 
 
 async def test_unknown_category_without_strength_ignored():

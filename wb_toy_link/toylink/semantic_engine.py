@@ -26,6 +26,8 @@ _SENTENCE_END = re.compile(r"[.!?][\"'”’)\]]*(\s|$)")
 PROMPT_TEMPLATE = """You classify a snippet of roleplay prose for a haptics (vibration) controller.
 Judge the CURRENT moment of physical/erotic intensity at the END of the snippet — what is happening now, not what is remembered, negated, or merely discussed.
 
+Answer IMMEDIATELY with your first impression. Do not reason step by step, do not deliberate, do not weigh alternatives — this is a low-stakes, latency-critical call made every few seconds, and a fast approximate answer is worth more than a slow careful one. If unsure, answer no_change.
+
 Categories (pick exactly one):
 {categories}
 
