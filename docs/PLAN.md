@@ -11,7 +11,7 @@ This repo (`FlippRipp/Worldbox-Sex-Toy-Integration-`) will hold a haptics module
 2. Primary trigger: **keyword detection during LLM token streaming** — react in real time as prose streams, with per-keyword strength and pattern (latched state, no durations — user's explicit choice).
 3. Manual control panel + safety: status widget, test buzz, master intensity cap, instant stop.
 4. **Semantic triggers via OpenRouter** (user-confirmed): a small instruct LLM classifies streamed prose near-real-time, fixing keyword imprecision (negation, memories, paraphrase). **`trigger_mode: "hybrid"` is the default** — keywords react instantly, semantic verdicts override with authority ~1 s later. Degrades to keywords-only when no API key is configured.
-5. **Extend WorldboxAI's module API** (user-approved): add official `on_stream_token` + turn-lifecycle hooks to core on a branch in FlippRipp/WorldboxAI. The toy module **requires** these hooks — no `emit_token` monkey-patch fallback (user's explicit choice). On an older WorldboxAI checkout the module loads but disables itself with a clear "update WorldboxAI" status message.
+5. **Extend WorldboxAI's module API** — specced as a standalone implementation request (`docs/WORLDBOXAI_HOOKS_REQUEST.md`) that **Filip implements in WorldboxAI himself**; this project never pushes to that repo (user's choice, replacing the earlier plan to develop the hooks on a WorldboxAI branch). The toy module **requires** these hooks — no `emit_token` monkey-patch fallback (user's explicit choice). On an older WorldboxAI checkout the module loads but disables itself with a clear "update WorldboxAI" status message.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ REST router + /toys command + widgets ──────────────
                                                 (httpx :20010/command)  (vendored bp v3 over websockets)
 ```
 
-### WorldboxAI core API extension (new — branch `claude/module-stream-hooks` in FlippRipp/WorldboxAI)
+### WorldboxAI core API extension (handed off — full spec in `docs/WORLDBOXAI_HOOKS_REQUEST.md`, implemented by Filip)
 
 Small, generic addition (~30-50 lines) that benefits any module (TTS, sound effects, live translation), not just haptics:
 
@@ -37,7 +37,7 @@ Small, generic addition (~30-50 lines) that benefits any module (TTS, sound effe
 3. **Feature detection** — add `MODULE_API_FEATURES = {"stream_tokens", "turn_lifecycle"}` as a class attribute on `EngineGraph`. The toy module reads `getattr(services["engine"], "MODULE_API_FEATURES", set())` in `set_services`: if `stream_tokens` is missing, the module marks itself inactive and surfaces "requires updated WorldboxAI (stream hooks)" in `/status` and the sidebar widget. **No `emit_token` monkey-patch fallback** (user's explicit choice — keeps the module 100 % official-API).
 4. Document the new hooks in `docs/MODULES.md`, and extend `test_module_contract.py` with a test that a stub module's `on_stream_token`/`on_turn_start`/`on_turn_stopped` get called (fake streaming callback, no LLM).
 
-Workflow note: requires adding the WorldboxAI repo to this session (`add_repo` with push access — user approved). Work lands on branch `claude/module-stream-hooks`; no pushes to WorldboxAI's default branch, and no PR unless the user asks.
+Workflow note: the core changes go through the implementation request doc — Filip implements them in WorldboxAI. This project makes no pushes to the WorldboxAI repo; module development proceeds against the request's contract using stub engines in tests, and integration verification waits for a WorldboxAI build that implements it.
 
 Streaming path facts core work builds on: storyteller passes `streaming_callback=self.sdk.ui.emit_token` looked up fresh each turn (`graph.py:824`); one `WorldBoxSDK` per `EngineGraph` (`graph.py:43`); engine created once at import (`server.py:96`); turn cancel handler at `server.py:2679-2680`. The fan-out wrapper lives in core at the `streaming_callback` construction site, and `on_turn_stopped` dispatch goes in both the cancel handler and normal turn completion.
 
@@ -126,7 +126,7 @@ tools/dev_console.py    # REPL: type prose, watch levels / drive real devices sa
 ## Implementation order
 
 1. Scaffold repo (LICENSE, pytest.ini, requirements-dev.txt, manifest, empty package). Verify: symlink into the scratchpad WorldboxAI checkout → registry loads "Toy Link" with no validation errors.
-2. **WorldboxAI core hooks**: `add_repo` FlippRipp/WorldboxAI (push access), branch `claude/module-stream-hooks`; implement `on_stream_token` / `on_turn_start` / `on_turn_stopped` dispatch + `MODULE_API_FEATURES` flag + `docs/MODULES.md` update + contract test. Verify: WorldboxAI's `python -m pytest test_module_contract.py` green; push branch.
+2. **WorldboxAI core hooks — handoff**: `docs/WORLDBOXAI_HOOKS_REQUEST.md` is the deliverable (API contract, dispatch points, ordering/exactly-once guarantees, acceptance tests); Filip implements it in WorldboxAI. Steps 3–9 proceed in parallel against the contract with stub engines; only integration verification blocks on the real implementation.
 3. `keyword_engine.py` + `patterns.py` + tests (pure logic): token-split matches, word boundaries, tail flush on end_of_turn, last-wins latching, stop-words, waveform math, cap, clamps.
 4. `config_store.py` (defaults, load/merge/save, RuleSet resolution) + round-trip test.
 5. `buttplug_client.py` + fake-server test (handshake order, Id/future matching, ScalarCmd framing, reconnect after drop).
@@ -135,12 +135,12 @@ tools/dev_console.py    # REPL: type prose, watch levels / drive real devices sa
 8. `semantic_engine.py` + MockTransport tests (fake OpenRouter: sentence-boundary cadence, single in-flight/latest-window behavior, JSON verdict parsing incl. `no_change`, hybrid override of keyword-set state, fail-quiet on error/refusal/malformed JSON, backoff after consecutive failures, keywords-only degradation without api_key).
 9. `backend.py`: feature detection (require official hooks; disable with clear status if absent), `on_stream_token`/`on_turn_start`/`on_turn_stopped` implementations fanning tokens to keyword scanner + semantic chunker per `trigger_mode`, `/toys` command, router, gating + `test_hooks_contract.py`.
 10. Frontend: `widget.jsx` (incl. floating toggle — resolve the portal/whitelist verify item first), `widget_settings.jsx`, `ui/ToyStudio.jsx`.
-11. Docs + installers; default rules.json. README states the module requires a WorldboxAI build with the stream-hook module API (the `claude/module-stream-hooks` branch until merged), and documents the semantic mode's privacy/cost note + OpenRouter key setup.
+11. Docs + installers; default rules.json. README states the module requires a WorldboxAI build with the stream-hook module API (see `docs/WORLDBOXAI_HOOKS_REQUEST.md`), and documents the semantic mode's privacy/cost note + OpenRouter key setup.
 
 ## Verification
 
 - `pip install -r requirements-dev.txt && pytest` — green standalone (no WorldboxAI checkout needed).
-- Integration (in this environment): symlink `wb_toy_link` into the WorldboxAI checkout on the `claude/module-stream-hooks` branch, start the backend (`python main.py` after `pip install -r requirements.txt`), confirm module loads and reports "official hooks" mode in `/status`, `curl localhost:8321/api/modules/wb_toy_link/status` works, and a scripted fake-token feed (or a fake ws client against a locally-run Intiface stub from the test suite) shows effects firing while streaming; point `semantic.base_url` at a local fake-OpenRouter stub to verify the hybrid override end-to-end (keyword sets state, semantic verdict corrects it). Also check against an unmodified WorldboxAI checkout: module loads but reports "requires updated WorldboxAI" and drives nothing.
+- Integration (once Filip's hook implementation exists): symlink `wb_toy_link` into a WorldboxAI checkout that implements the hooks request, start the backend (`python main.py` after `pip install -r requirements.txt`), confirm module loads and reports "official hooks" mode in `/status`, `curl localhost:8321/api/modules/wb_toy_link/status` works, and a scripted fake-token feed (or a fake ws client against a locally-run Intiface stub from the test suite) shows effects firing while streaming; point `semantic.base_url` at a local fake-OpenRouter stub to verify the hybrid override end-to-end (keyword sets state, semantic verdict corrects it). Also check against an unmodified WorldboxAI checkout: module loads but reports "requires updated WorldboxAI" and drives nothing.
 - Real hardware (user, post-merge): Intiface Central simulated device → keyword mid-stream buzzes <300 ms after the word renders; STOP zeroes instantly; floating toggle off silences immediately and toggle on ramps back to the story's current intensity/pattern; with a real OpenRouter key, a false-positive keyword (e.g. a negated phrase) gets corrected by the semantic verdict within a couple of seconds; Lovense Remote Game Mode on-LAN → enter IP in Toy Studio, GetToys populates, test buzz, confirm exact API envelope (flagged verify-live item).
 
-Commit and push: this repo's work to `claude/sex-toy-integration-njsalj`; WorldboxAI core hooks to `claude/module-stream-hooks` in FlippRipp/WorldboxAI (no PRs unless requested).
+Commit and push: this repo's work to the session's designated branch, then fast-forward `main` (per CLAUDE.md). No pushes to FlippRipp/WorldboxAI — core changes go through `docs/WORLDBOXAI_HOOKS_REQUEST.md`.
