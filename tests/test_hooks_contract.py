@@ -274,6 +274,22 @@ def test_router_config_sanitization_and_rules_roundtrip(tmp_path):
     assert client.put("/api/modules/wb_toy_link/rules", json={"nope": 1}).status_code == 422
 
 
+def test_router_manual_drive(tmp_path):
+    client = make_client(tmp_path)
+    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": 62}).json()
+    assert out == {"ok": True, "strength": 62.0}
+    assert BACKEND._vibe.strength == 62.0
+    assert BACKEND._vibe.source == "manual:drive"
+    # Clamps garbage, and un-mutes: manual drive is explicit intent.
+    client.post("/api/modules/wb_toy_link/toggle")
+    assert BACKEND._vibe.vibe_on is False
+    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": 900}).json()
+    assert out["strength"] == 100.0
+    assert BACKEND._vibe.vibe_on is True
+    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": "junk"}).json()
+    assert out["strength"] == 0.0
+
+
 def test_router_rules_tester(tmp_path):
     client = make_client(tmp_path)
     out = client.post("/api/modules/wb_toy_link/rules/test", json={

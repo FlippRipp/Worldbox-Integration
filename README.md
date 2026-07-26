@@ -30,7 +30,9 @@ devices.
   `timeSec` keepalive so even a crashed host stops the toy within ~2 s.
 - **A floating on/off button** you can drag anywhere: tap to mute (devices go
   silent, the story keeps tracking), tap again to ramp back to the scene's
-  current intensity.
+  current intensity. **Hold it still for a moment, then drag** to enter manual
+  drive: strength follows your hand speed — wiggle fast for more, stop moving
+  to fade out, release mid-motion to hold that level.
 - **Toy Studio** — a main-menu screen with all settings: devices, trigger
   rules (with a paste-a-paragraph tester), classifier model, caps.
 
@@ -69,7 +71,8 @@ server, connect your toys, then enable the backend in Toy Studio (default
 ## Use
 
 - Sidebar widget: status per backend, live intensity bar, STOP, mute, test.
-- Floating button: drag it wherever you like; tap toggles vibration.
+- Floating button: drag it wherever you like; tap toggles vibration;
+  hold-then-drag drives strength by hand speed (manual mode).
 - `/toys` in the chat composer: `stop | on | off | test [0-100] | status`.
 - Toy Studio (main menu): everything configurable, including the trigger
   rules and their categories. The tester box shows exactly what a paragraph

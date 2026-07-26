@@ -310,6 +310,19 @@ def get_router():
         await _manager.set_gate(not _vibe.vibe_on)
         return {"ok": True, "vibe_on": _vibe.vibe_on}
 
+    @router.post("/manual")
+    async def manual(body: dict | None = None):
+        """Manual drive (floating-button velocity mode): sets the latch
+        directly. Un-mutes — wiggling the button is explicit intent."""
+        try:
+            strength = min(max(float((body or {}).get("strength", 0)), 0.0), 100.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        _vibe.set_gate(True)
+        _vibe.set_target(strength, "constant", None, source="manual:drive")
+        _manager.ensure_running()
+        return {"ok": True, "strength": strength}
+
     @router.post("/test")
     async def test(body: dict | None = None):
         strength = float((body or {}).get("strength", 50))
