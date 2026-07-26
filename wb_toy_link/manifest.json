@@ -1,0 +1,47 @@
+{
+  "id": "wb_toy_link",
+  "name": "Toy Link",
+  "version": "1.0.0",
+  "icon": "🔗",
+  "description": "Haptics integration: drives Lovense and buttplug.io/Intiface devices from the story in real time. Keyword and semantic triggers with per-category strength and patterns; configure devices, triggers, and models in the Toy Studio main-menu entry.",
+  "dependencies": [],
+  "consumes": {
+    "state": ["turn"],
+    "module_data": [],
+    "module_configs": [],
+    "world_data": false
+  },
+  "produces": {
+    "module_data": false,
+    "context_string": false,
+    "messages": true
+  },
+  "ui_slots": ["slot_sidebar"],
+  "commands": {
+    "/toys": "on_command_toys"
+  },
+  "command_help": {
+    "/toys": "Control toys: stop | on | off | test [0-100] | status"
+  },
+  "settings_schema": {
+    "enabled": {
+      "type": "toggle",
+      "default": true
+    },
+    "master_cap": {
+      "type": "slider",
+      "min": 0,
+      "max": 100,
+      "default": 70
+    }
+  },
+  "modes": [
+    {
+      "id": "toy-studio",
+      "label": "Toy Studio",
+      "description": "Devices, triggers, and haptics settings",
+      "icon": "🎛️",
+      "screen": "ui/ToyStudio.jsx"
+    }
+  ]
+}
