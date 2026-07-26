@@ -281,6 +281,30 @@ def test_router_rules_tester(tmp_path):
     assert [e["rule_id"] for e in out["keyword_effects"]] == ["r_kiss", "r_sleep"]
     assert "semantic_verdict" not in out              # not requested
 
+    # Before any turn has run there is no hook-captured sdk — the tester must
+    # still reach the LLM through the engine service (the bug report: "no llm
+    # access" from Toy Studio on a fresh backend).
     out = client.post("/api/modules/wb_toy_link/rules/test", json={
         "text": "hello", "semantic": True}).json()
-    assert "semantic_error" in out                    # no sdk captured yet: fails quiet
+    assert out.get("semantic_verdict") == {"no_change": True}
+    assert "semantic_error" not in out
+
+
+async def test_classify_uses_engine_sdk_before_first_turn(tmp_path):
+    engine = StubEngine()
+    engine.sdk = StubSDK()                            # graph.py owns one of these
+    engine.sdk.llm.response = json.dumps({"category": "gentle"})
+    wire(tmp_path, engine=engine)
+    raw = await BACKEND._classify_call("prompt text")
+    assert json.loads(raw) == {"category": "gentle"}
+    assert engine.sdk.llm.calls[0]["preference"] == "fastest"
+    assert engine.llm.calls == []                     # bridge preferred over raw llm
+
+
+async def test_classify_falls_back_to_engine_llm_without_any_sdk(tmp_path):
+    engine, _, _ = wire(tmp_path)                     # StubEngine has no .sdk
+    engine.llm.response = json.dumps({"no_change": True})
+    raw = await BACKEND._classify_call("prompt text")
+    assert json.loads(raw) == {"no_change": True}
+    # Uses the app's fast model explicitly, so the right slot is billed/logged.
+    assert engine.llm.calls[0]["model"] == "provider/fast-model"

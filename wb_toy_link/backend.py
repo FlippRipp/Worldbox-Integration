@@ -83,19 +83,28 @@ async def shutdown() -> None:
 async def _classify_call(prompt: str) -> str:
     """Semantic classifier call: the user's per-module model override goes
     straight to engine.llm; otherwise the sdk bridge's "fastest" slot
-    (module_fast_model) — provider-agnostic, inherits keys and retries."""
+    (module_fast_model) — provider-agnostic, inherits keys and retries.
+    The sdk comes from the hooks when a turn has run, or from engine.sdk
+    (graph.py owns one) so Toy Studio's tester works before any turn; as a
+    last resort call engine.llm with the fast model directly."""
     override = (_store.config().get("semantic", {}) or {}).get("model_override", "")
     engine = _services.get("engine")
+    inspector_ctx = {"call_type": "module_fast",
+                     "step": "module:toy_link_semantic",
+                     "module_source": MODULE_ID}
     if override and engine is not None:
         return await engine.llm.simple_completion(
             messages=[{"role": "user", "content": prompt}],
-            model=override, temperature=0,
-            inspector_ctx={"call_type": "module_fast",
-                           "step": "module:toy_link_semantic",
-                           "module_source": MODULE_ID})
-    if _sdk is not None:
-        return await _sdk.llm.generate(prompt, model_preference="fastest")
-    raise RuntimeError("no LLM access (no sdk yet and no model override)")
+            model=override, temperature=0, inspector_ctx=inspector_ctx)
+    sdk = _sdk or getattr(engine, "sdk", None)
+    if sdk is not None:
+        return await sdk.llm.generate(prompt, model_preference="fastest")
+    if engine is not None:
+        model = _app_default_model() or None
+        return await engine.llm.simple_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=model, temperature=0, inspector_ctx=inspector_ctx)
+    raise RuntimeError("no LLM access: engine service unavailable")
 
 
 def _app_default_model() -> str:
