@@ -17,7 +17,14 @@ import asyncio
 import math
 import time
 
-from .patterns import PATTERN_SPECS, VibeState, build_lovense_phrase, normalize_pattern
+from .patterns import (
+    PATTERN_SPECS,
+    VibeState,
+    build_lovense_phrase,
+    normalize_arc,
+    normalize_pattern,
+    sentence_arc_gain,
+)
 
 KEEPALIVE_S = 0.85
 MIN_CHANGE_RESEND_S = 0.12              # coalesce rapid manual slider drags
@@ -61,9 +68,11 @@ class DeviceManager:
         # Gapless hardware-loop stream tracking
         self._pattern_stream_active: bool = False
         self._sent_mode_key: tuple | None = None
+        self._sent_pattern: str = ""
         self._sent_eff_norm: float = -1.0
         self._sent_pace: float = -1.0
         self._last_pattern_send_at: float = -999.0
+        self._sentence_settle_after_s: float = 999.0
 
         # Conflict-free preview state (seconds <= 0 => loop until stopped)
         self._preview_id: int = 0
@@ -150,7 +159,15 @@ class DeviceManager:
                 self._preview_loop = False
                 self._preview_envelope = 0.0
 
-            target = self.vibe.strength if self.vibe.vibe_on else 0.0
+            base_target = self.vibe.strength if self.vibe.vibe_on else 0.0
+            if base_target > 0.5 and self.vibe.params.get("sentence_cue") and self.vibe.pattern != "afterglow":
+                elapsed_cue = max(0.0, now - self.vibe.latched_at)
+                cue_dur = max(1.3, float(self.vibe.params.get("duration_s") or 3.4))
+                arc_mult = sentence_arc_gain(self.vibe.params.get("arc"), min(1.0, elapsed_cue / cue_dur))
+                target = min(100.0, base_target * arc_mult)
+            else:
+                target = base_target
+
             if not self.vibe.vibe_on:
                 self.envelope = 0.0
             elif self.vibe.pattern == "afterglow" and self.envelope > target and target > 0.0:
@@ -296,8 +313,82 @@ class DeviceManager:
             )
             return
 
+        # Shaped per-sentence Stage cue: smooth entry ramp from live intensity + within-sentence arc
+        base_eff_norm = max(0.0, min(1.0, (self.vibe.strength / 100.0) * cap))
+        if self.vibe.params.get("sentence_cue") and self.vibe.pattern != "afterglow":
+            cue_id = self.vibe.params.get("cue_id")
+            arc = normalize_arc(self.vibe.params.get("arc"))
+            dur_s = max(1.3, float(self.vibe.params.get("duration_s") or 3.4))
+            cue_key = ("sentence", cue_id, round(cap, 3), contrast_mode)
+            settled_key = ("sentence_settled", cue_id, round(cap, 3), contrast_mode)
+
+            if self._pattern_stream_active and self._sent_mode_key == settled_key:
+                return
+
+            if self._pattern_stream_active and self._sent_mode_key == cue_key:
+                if (now - self._last_pattern_send_at) < self._sentence_settle_after_s:
+                    return
+                # Sentence held past one shaped phrase window: settle once into pure loop
+                end_eff = max(0.0, min(1.0, base_eff_norm * sentence_arc_gain(arc, 1.0)))
+                levels, interval_ms, _ = build_lovense_phrase(
+                    self.vibe.pattern,
+                    intensity_norm=end_eff,
+                    pace=self.vibe.pace,
+                    contrast_mode=contrast_mode,
+                    loop=True,
+                )
+                self._sent_mode_key = settled_key
+                self._sent_pattern = self.vibe.pattern
+                self._sent_eff_norm = end_eff
+                self._sent_pace = self.vibe.pace
+                self._last_pattern_send_at = now
+                await self._run_clients(
+                    [c.send_pattern(levels, interval_ms=interval_ms, loop=True) for c in pattern_clients],
+                    background_io,
+                )
+                return
+
+            prev_eff = (
+                max(0.0, self._sent_eff_norm)
+                if (self._pattern_stream_active and self._sent_eff_norm >= 0.0)
+                else max(0.0, min(1.0, (self.envelope / 100.0) * cap))
+            )
+            if (
+                arc == "steady"
+                and self._pattern_stream_active
+                and self._sent_pattern == self.vibe.pattern
+                and abs(base_eff_norm - prev_eff) < 0.012
+                and abs(self.vibe.pace - self._sent_pace) < 0.05
+            ):
+                self._sent_mode_key = settled_key
+                return
+
+            levels, interval_ms, _ = build_lovense_phrase(
+                self.vibe.pattern,
+                intensity_norm=base_eff_norm,
+                pace=self.vibe.pace,
+                contrast_mode=contrast_mode,
+                loop=True,
+                entry_norm=prev_eff,
+                arc=arc,
+                duration_s=dur_s,
+            )
+            end_eff = max(0.0, min(1.0, base_eff_norm * sentence_arc_gain(arc, 1.0)))
+            self._pattern_stream_active = True
+            self._sent_mode_key = cue_key
+            self._sent_pattern = self.vibe.pattern
+            self._sent_eff_norm = end_eff
+            self._sent_pace = self.vibe.pace
+            self._last_pattern_send_at = now
+            self._sentence_settle_after_s = max(2.2, ((len(levels) * interval_ms) / 1000.0) * 0.86)
+            await self._run_clients(
+                [c.send_pattern(levels, interval_ms=interval_ms, loop=True) for c in pattern_clients],
+                background_io,
+            )
+            return
+
         # Steady continuous pattern: loop natively in hardware (timeSec: 0) with zero refreshes!
-        eff_norm = max(0.0, min(1.0, (target / 100.0) * cap))
+        eff_norm = base_eff_norm
         mode_key = ("loop", self.vibe.pattern, contrast_mode)
         same_loop = (
             self._pattern_stream_active
@@ -319,6 +410,7 @@ class DeviceManager:
         )
         self._pattern_stream_active = True
         self._sent_mode_key = mode_key
+        self._sent_pattern = self.vibe.pattern
         self._sent_eff_norm = eff_norm
         self._sent_pace = self.vibe.pace
         self._last_pattern_send_at = now

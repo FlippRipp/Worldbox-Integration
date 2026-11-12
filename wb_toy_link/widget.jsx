@@ -66,6 +66,7 @@ function attachReaderBridge() {
         sentence_index: d.sentenceIndex ?? 0,
         char_start: d.charStart ?? 0,
         char_end: d.charEnd ?? 0,
+        duration_ms: d.durationMs ?? 0,
         text: d.text || '',
         reason: d.reason || '',
       }),
@@ -132,7 +133,32 @@ function useToyStatus() {
 
 // ---------------------------------------------------------------- floating orb
 
-let floatClaimed = false;
+let nextFloatCandidateId = 1;
+const floatCandidates = new Map();
+let activeFloatOwnerId = null;
+
+function registerFloatCandidate(onOwnerChange) {
+  const id = nextFloatCandidateId;
+  nextFloatCandidateId += 1;
+  floatCandidates.set(id, onOwnerChange);
+  if (activeFloatOwnerId === null) {
+    activeFloatOwnerId = id;
+    onOwnerChange(true);
+  } else {
+    onOwnerChange(false);
+  }
+  return () => {
+    floatCandidates.delete(id);
+    if (activeFloatOwnerId === id) {
+      activeFloatOwnerId = null;
+      const nextEntry = floatCandidates.entries().next().value;
+      if (nextEntry) {
+        activeFloatOwnerId = nextEntry[0];
+        nextEntry[1](true);
+      }
+    }
+  };
+}
 
 function clampPos(p) {
   const maxX = Math.max(8, (window.innerWidth || 400) - 58);
@@ -154,14 +180,8 @@ function loadFloatPos() {
 }
 
 function FloatingToggle({ status }) {
-  const [owner] = useState(() => {
-    if (floatClaimed) return false;
-    floatClaimed = true;
-    return true;
-  });
-  useEffect(() => () => {
-    if (owner) floatClaimed = false;
-  }, [owner]);
+  const [owner, setOwner] = useState(false);
+  useEffect(() => registerFloatCandidate(setOwner), []);
 
   const posRef = useRef(null);
   if (posRef.current === null && typeof window !== 'undefined') {
@@ -287,7 +307,7 @@ function Dot({ ok, warn }) {
   return <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${color}`} />;
 }
 
-export default function ToyLinkWidget({ state, config }) {
+export default function ToyLinkWidget({ state, config, slotName }) {
   const status = useToyStatus();
   const [busyConnect, setBusyConnect] = useState(false);
 
@@ -300,7 +320,7 @@ export default function ToyLinkWidget({ state, config }) {
     post('/story-sync', { enabled: storyEnabled, master_cap: storyCap, save_id: saveId });
   }, [storyEnabled, storyCap, saveId]);
 
-  // Stop toys cleanly when the last sidebar instance unmounts (leaving story to Main Menu)
+  // Stop toys cleanly when the last story slot unmounts (leaving story to Main Menu)
   useEffect(() => {
     widgetMountCount += 1;
     attachReaderBridge();
@@ -320,6 +340,12 @@ export default function ToyLinkWidget({ state, config }) {
       }
     };
   }, []);
+
+  // In slot_header, act purely as an always-mounted session & portal anchor so
+  // the floating orb and Stage sync stay active even when the sidebar is closed.
+  if (slotName === 'slot_header') {
+    return <FloatingToggle status={status} />;
+  }
 
   if (!status) {
     return (

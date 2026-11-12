@@ -212,3 +212,29 @@ def test_ocean_swell_long_gradual_zero_to_full_and_down():
     assert all(steps[i] >= steps[i + 1] for i in range(last_peak_idx, len(steps) - 1))
 
 
+def test_shaped_sentence_phrase_entry_ramp_and_arcs():
+    from toylink.patterns import build_lovense_phrase
+
+    # Entry ramp from 0.20 into 0.85 rising sentence cue starts gently near 0.20 and climbs
+    rise_lv, _, _ = build_lovense_phrase(
+        "velvet",
+        intensity_norm=0.80,
+        pace=0.5,
+        entry_norm=0.20,
+        arc="rise",
+        duration_s=3.2,
+    )
+    ease_lv, _, _ = build_lovense_phrase(
+        "velvet",
+        intensity_norm=0.80,
+        pace=0.5,
+        entry_norm=0.80,
+        arc="ease",
+        duration_s=3.2,
+    )
+    assert rise_lv[0] < 0.35
+    assert max(rise_lv[20:]) > 0.75
+    assert sum(ease_lv[:8]) / 8 > sum(ease_lv[25:35]) / 10
+
+
+

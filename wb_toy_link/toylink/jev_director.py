@@ -18,7 +18,7 @@ import asyncio
 import re
 import time
 
-from .patterns import PATTERNS, normalize_pattern
+from .patterns import PATTERNS, SENTENCE_ARCS, normalize_arc, normalize_pattern
 
 MODULE_ID = "wb_toy_link"
 
@@ -148,10 +148,9 @@ def split_stage_sentences(raw_text: str, *, is_complete: bool = True) -> list[di
             is_abbr = is_single_dot and _ends_with_abbreviation(cleaned[seg_start:i])
             at_end = after >= n
             followed_by_space = (not at_end) and cleaned[after].isspace()
-            still_in_quote = straight_after or curly_after
             cand_len = _visible_len(cleaned[seg_start:after])
 
-            if (not is_abbr) and (followed_by_space or (at_end and is_complete)) and ((not still_in_quote) or cand_len >= 150):
+            if (not is_abbr) and (followed_by_space or (at_end and is_complete)):
                 next_non_space = after
                 nl_count = 0
                 while next_non_space < n and cleaned[next_non_space].isspace():
@@ -228,6 +227,14 @@ PACE_CRITERIA: dict[str, str] = {
     "frantic": "Breathless, relentless, frantic speed.",
 }
 
+ARC_ORDER: tuple[str, ...] = SENTENCE_ARCS
+ARC_CRITERIA: dict[str, str] = {
+    "steady": "Consistent, sustained rhythm or touch across this sentence.",
+    "rise": "Gradually building tension, closeness, pressure, or speed through this sentence.",
+    "surge": "A pronounced crest, thrust, gasp, kiss, or wave peaking within this sentence.",
+    "ease": "Softening, catching breath, tender dialogue, or lingering gently while staying connected.",
+}
+
 PATTERN_CRITERIA: dict[str, str] = {
     "velvet": "Continuous close contact, warm embrace, lingering kiss, or steady sensual pressure.",
     "swell": "Slow, deep, gradually building sensual waves — long rising arousal, slow deep kissing, lingering full-body caresses.",
@@ -283,33 +290,45 @@ def build_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) ->
 
 
 def build_sentence_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) -> dict:
-    """Questions scoped specifically to ``current_sentence`` for Stage Reader sync."""
+    """Questions scoped to ``current_sentence`` with full active-state continuity."""
     allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA] or list(PATTERNS)
     questions: dict = {
         "engaged": {
             "type": "noul",
             "instructions": (
-                "Is physical touch, bodily intimacy, or erotic stimulation actively "
-                "happening during current_sentence (using turn_so_far as context)? "
-                "Answer no for negations, memories, plans, or purely non-physical dialogue/description."
+                "Taking turn_so_far, active_haptic_state, and recent_sentence_history into account, "
+                "is physical touch, bodily closeness, or erotic stimulation either starting in "
+                "current_sentence OR still ongoing in the scene during current_sentence? "
+                "IMPORTANT: Spoken dialogue, eye contact, breathing, thoughts, or atmosphere occurring "
+                "WHILE characters remain in an active physical embrace or encounter IS STILL ENGAGED "
+                "(answer yes). Answer no ONLY if no physical contact has started yet, or if the characters "
+                "explicitly pull apart, stop touching, or end the encounter."
             ),
         },
         "wind_down": {
             "type": "noul",
             "instructions": (
-                "Does an active physical or intimate moment wind down, pause, finish, "
-                "or settle into post-climax rest/afterglow in current_sentence?"
+                "Does current_sentence explicitly describe the characters stopping physical contact, "
+                "pulling apart, pausing the encounter, or settling into post-climax rest/afterglow?"
             ),
         },
         "intensity": {
             "type": "choice",
-            "instructions": "Choose the physical/erotic intensity during current_sentence.",
+            "instructions": (
+                "Choose the physical/erotic intensity during current_sentence (accounting for "
+                "active_haptic_state so ongoing scenes transition smoothly rather than resetting)."
+            ),
             "criteria": dict(INTENSITY_CRITERIA),
         },
         "pace": {
             "type": "choice",
             "instructions": "Choose the physical tempo/pace during current_sentence.",
             "criteria": dict(PACE_CRITERIA),
+        },
+        "arc": {
+            "type": "choice",
+            "instructions": "Choose how the sensation shapes across current_sentence.",
+            "criteria": dict(ARC_CRITERIA),
         },
     }
     if len(allowed) >= 2:
@@ -338,6 +357,10 @@ def interpret_answers(
     current_strength: float = 0.0,
     sensitivity: float = 1.0,
     pattern_override: str | None = None,
+    sentence_mode: bool = False,
+    current_pattern: str = "velvet",
+    current_pace: float = 0.45,
+    low_engagement_streak: int = 0,
 ) -> dict:
     """Pure decision interpreter -> ``{action, strength, pattern, pace, ...}``."""
     allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA] or list(PATTERNS)
@@ -347,6 +370,8 @@ def interpret_answers(
     int_ans = answers.get("intensity") or {}
     pace_ans = answers.get("pace") or {}
     pat_ans = answers.get("pattern") or {}
+    arc_ans = answers.get("arc") or {}
+    chosen_arc = normalize_arc(arc_ans.get("choice")) if sentence_mode else "steady"
 
     if engaged_ans.get("type") != "noul" or wind_ans.get("type") != "noul":
         return {"action": "hold", "reason": "missing engagement answer"}
@@ -354,8 +379,8 @@ def interpret_answers(
     p_engaged = float(engaged_ans.get("noul", 0.0))
     p_wind = float(wind_ans.get("noul", 0.0))
 
-    # Not engaged -> wind down via afterglow or ramp smoothly to 0
-    if p_engaged < 0.25:
+    # Not engaged -> wind down via afterglow, hold active scene continuity, or ramp to 0
+    if p_engaged < 0.45:
         if p_wind >= 0.45 and current_strength > 8.0 and "afterglow" in allowed:
             pat = normalize_pattern(pattern_override) if pattern_override else "afterglow"
             return {
@@ -363,21 +388,53 @@ def interpret_answers(
                 "strength": round(min(max(current_strength, 24.0), 48.0), 1),
                 "pattern": pat,
                 "pace": 0.22,
+                "arc": "ease",
                 "engaged": round(p_engaged, 3),
                 "wind_down": round(p_wind, 3),
             }
+
+        if sentence_mode and current_strength > 8.0 and current_pattern != "afterglow":
+            # Explicit disengagement or 2+ prior low-engagement sentences -> step down cleanly
+            explicit_stop = p_engaged <= 0.12 and p_wind >= 0.28
+            sustained_shift = low_engagement_streak >= 2 and p_engaged <= 0.24
+            if explicit_stop or sustained_shift:
+                return {
+                    "action": "apply",
+                    "strength": 0.0,
+                    "pattern": normalize_pattern(pattern_override or "velvet"),
+                    "pace": 0.25,
+                    "arc": "ease",
+                    "engaged": round(p_engaged, 3),
+                    "wind_down": round(p_wind, 3),
+                }
+            # Mid-scene dialogue, eye contact, or atmospheric sentence: preserve
+            # the active vibration with a gentle softening rather than cutting to 0%.
+            keep_pat = normalize_pattern(pattern_override or current_pattern)
+            if not pattern_override and keep_pat not in allowed:
+                keep_pat = allowed[0]
+            eased_strength = round(max(14.0, current_strength * 0.86), 1)
+            eased_pace = round(max(0.15, min(1.0, float(current_pace) * 0.90)), 2)
+            return {
+                "action": "apply",
+                "strength": eased_strength,
+                "pattern": keep_pat,
+                "pace": eased_pace,
+                "arc": "ease",
+                "continuity_hold": True,
+                "engaged": round(p_engaged, 3),
+                "wind_down": round(p_wind, 3),
+            }
+
         if p_engaged <= 0.15:
             return {
                 "action": "apply",
                 "strength": 0.0,
                 "pattern": normalize_pattern(pattern_override or "velvet"),
                 "pace": 0.25,
+                "arc": "steady",
                 "engaged": round(p_engaged, 3),
                 "wind_down": round(p_wind, 3),
             }
-        return {"action": "hold", "reason": "ambiguous low engagement", "engaged": round(p_engaged, 3)}
-
-    if p_engaged < 0.45:
         return {"action": "hold", "reason": "uncertain engagement", "engaged": round(p_engaged, 3)}
 
     int_probs = int_ans.get("probabilities") if int_ans.get("type") == "choice" else None
@@ -389,6 +446,16 @@ def interpret_answers(
     scaled_strength = min(100.0, max(0.0, raw_strength * max(0.5, min(1.5, float(sensitivity)))))
     if 0.0 < scaled_strength < 10.0 and int_ans.get("choice") != "none":
         scaled_strength = 10.0
+
+    # Smooth downward dips during ongoing sentence-by-sentence scenes so a softer
+    # transitional sentence blends naturally instead of dropping steeply.
+    if (
+        sentence_mode
+        and current_strength > 12.0
+        and p_wind < 0.35
+        and 0.0 < scaled_strength < current_strength * 0.58
+    ):
+        scaled_strength = 0.62 * scaled_strength + 0.38 * current_strength
 
     if isinstance(pace_probs, dict) and _band_coherent(pace_probs, PACE_ORDER, radius=1, min_mass=0.60):
         pace = sum(float(pace_probs.get(k, 0.0)) * PACE_ANCHORS[k] for k in PACE_ORDER)
@@ -412,7 +479,7 @@ def interpret_answers(
             if pat_conf < 0.75:
                 chosen_pat = "crest"
 
-    return {
+    res = {
         "action": "apply",
         "strength": round(scaled_strength, 1),
         "pattern": chosen_pat,
@@ -421,16 +488,28 @@ def interpret_answers(
         "wind_down": round(p_wind, 3),
         "top_intensity": int_ans.get("choice", ""),
     }
+    if sentence_mode:
+        res["arc"] = chosen_arc
+    return res
 
 
 class JevDirector:
     """Streams turn tokens, coalesces JEV calls, and steers ``VibeState``."""
 
-    def __init__(self, decide_call, get_config, apply_effect, get_current_strength, clock=time.monotonic):
+    def __init__(
+        self,
+        decide_call,
+        get_config,
+        apply_effect,
+        get_current_strength,
+        clock=time.monotonic,
+        get_current_vibe=None,
+    ):
         self._decide_call = decide_call          # async (state, questions, step) -> Decision
         self._get_config = get_config
         self._apply_effect = apply_effect
         self._get_current_strength = get_current_strength
+        self._get_current_vibe = get_current_vibe
         self._clock = clock
 
         self.pattern_override: str | None = None
@@ -452,7 +531,12 @@ class JevDirector:
         self._sentence_worker: asyncio.Task | None = None
         self._cue_event: asyncio.Event | None = None
         self._simulated_strength: float = 0.0
+        self._simulated_pattern: str = "velvet"
+        self._simulated_pace: float = 0.45
+        self._simulated_low_streak: int = 0
+        self._simulated_history: list[dict] = []
         self._active_reader_idx: int = -1
+        self._cue_counter: int = 0
 
         self.calls: int = 0
         self.last_verdict: dict | None = None
@@ -496,7 +580,12 @@ class JevDirector:
         self._queued_count = 0
         self._pending_sentences = []
         self._sentence_cues = {}
-        self._simulated_strength = float(self._get_current_strength())
+        cur_vibe = (self._get_current_vibe() or {}) if self._get_current_vibe else {}
+        self._simulated_strength = float(cur_vibe.get("strength", self._get_current_strength()))
+        self._simulated_pattern = normalize_pattern(cur_vibe.get("pattern") or "velvet")
+        self._simulated_pace = float(cur_vibe.get("pace", 0.45))
+        self._simulated_low_streak = 0
+        self._simulated_history = []
         self._active_reader_idx = -1
 
     def invalidate(self) -> None:
@@ -615,8 +704,7 @@ class JevDirector:
                         "text": item["text"],
                         "verdict": verdict,
                     }
-                    if verdict.get("action") == "apply":
-                        self._simulated_strength = float(verdict.get("strength", 0.0))
+                    self._record_simulated_verdict(idx, item["text"], verdict)
                     ev = self._get_cue_event()
                     ev.set()
                     ev.clear()
@@ -625,6 +713,29 @@ class JevDirector:
                 self._sentence_worker = None
                 if self._pending_sentences and seq == self._seq:
                     self._ensure_sentence_worker()
+
+    def _record_simulated_verdict(self, idx: int, text: str, verdict: dict) -> None:
+        p_eng = float(verdict.get("engaged", 0.5))
+        if p_eng < 0.38:
+            self._simulated_low_streak += 1
+        else:
+            self._simulated_low_streak = 0
+
+        if verdict.get("action") == "apply":
+            self._simulated_strength = float(verdict.get("strength", 0.0))
+            self._simulated_pattern = normalize_pattern(verdict.get("pattern") or self._simulated_pattern)
+            self._simulated_pace = float(verdict.get("pace", self._simulated_pace))
+            if self._simulated_strength <= 0.5 or self._simulated_pattern == "afterglow":
+                self._simulated_low_streak = 0
+
+        self._simulated_history.append({
+            "sentence_index": idx,
+            "sentence": text,
+            "strength": round(self._simulated_strength, 1),
+            "pattern": self._simulated_pattern,
+            "pace": round(self._simulated_pace, 2),
+            "arc": verdict.get("arc", "steady"),
+        })
 
     async def _score_sentence_item(self, seq: int, item: dict) -> dict | None:
         enabled_patterns = self._enabled_patterns()
@@ -635,6 +746,13 @@ class JevDirector:
             "turn_so_far": item.get("preceding", ""),
             "current_sentence": item["text"],
             "current_haptic_strength": round(float(self._simulated_strength), 1),
+            "active_haptic_state": {
+                "active": self._simulated_strength > 5.0 and self._simulated_pattern != "afterglow",
+                "strength": round(float(self._simulated_strength), 1),
+                "pattern": self._simulated_pattern,
+                "pace": round(float(self._simulated_pace), 2),
+            },
+            "recent_sentence_history": list(self._simulated_history),
         }
         decision = None
         try:
@@ -660,6 +778,10 @@ class JevDirector:
                 current_strength=float(self._simulated_strength),
                 sensitivity=sensitivity,
                 pattern_override=self.pattern_override,
+                sentence_mode=True,
+                current_pattern=self._simulated_pattern,
+                current_pace=self._simulated_pace,
+                low_engagement_streak=self._simulated_low_streak,
             )
             self.last_verdict = verdict
             self.last_error = ""
@@ -696,6 +818,7 @@ class JevDirector:
         char_start: int = 0,
         char_end: int = 0,
         text: str = "",
+        duration_ms: int = 0,
     ) -> dict | None:
         """Apply the pre-scored cue for the sentence now appearing on Stage."""
         self.reader_mode_active = True
@@ -741,6 +864,7 @@ class JevDirector:
                     "text": text,
                     "verdict": verdict,
                 }
+                self._record_simulated_verdict(sentence_index, text, verdict)
         else:
             return None
 
@@ -751,6 +875,15 @@ class JevDirector:
             eff = dict(verdict)
             if self.pattern_override:
                 eff["pattern"] = normalize_pattern(self.pattern_override)
+            self._cue_counter += 1
+            dur_s = round(max(1.3, (duration_ms / 1000.0) if duration_ms > 0 else 3.4), 2)
+            eff["params"] = {
+                **(eff.get("params") or {}),
+                "sentence_cue": True,
+                "cue_id": self._cue_counter,
+                "arc": normalize_arc(eff.get("arc")),
+                "duration_s": dur_s,
+            }
             self._apply_effect(eff)
         return verdict
 

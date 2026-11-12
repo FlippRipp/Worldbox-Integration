@@ -198,3 +198,33 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
     await run_ticks(manager, clock, 20)
     assert len(pclient.patterns) == 2
 
+    # 3. Shaped per-sentence cues apply entry ramp + arc immediately and settle into steady loop if held > 7s
+    pclient.patterns.clear()
+    vibe.set_target(
+        76,
+        "velvet",
+        {"sentence_cue": True, "cue_id": 1, "arc": "rise", "duration_s": 3.0},
+        source="jev:velvet",
+        pace=0.55,
+    )
+    await run_ticks(manager, clock, 40)  # 2.0s normal sentence reading -> single shaped packet
+    assert len(pclient.patterns) == 1
+    first_lv, _, _, _ = pclient.patterns[0]
+    assert first_lv[0] < first_lv[25]  # Smooth entry ramp from previous 50% up toward rising 76%
+
+    # Next sentence cue (even subtle change with 'ease' arc) updates immediately without 4.5% deadband skip
+    vibe.set_target(
+        74,
+        "velvet",
+        {"sentence_cue": True, "cue_id": 2, "arc": "ease", "duration_s": 2.8},
+        source="jev:velvet",
+        pace=0.50,
+    )
+    await run_ticks(manager, clock, 20)  # 1.0s
+    assert len(pclient.patterns) == 2
+
+    # Holding on Sentence 2 for 12s settles once into a pure steady loop and never spams again
+    await run_ticks(manager, clock, 240)
+    assert len(pclient.patterns) == 3
+
+

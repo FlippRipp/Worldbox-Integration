@@ -83,6 +83,33 @@ CONTRAST_MODES: dict[str, float] = {
     "high": 1.30,
 }
 
+SENTENCE_ARCS: tuple[str, ...] = ("steady", "rise", "surge", "ease")
+
+
+def normalize_arc(arc: str | None) -> str:
+    if not arc:
+        return "steady"
+    clean = str(arc).strip().lower()
+    return clean if clean in SENTENCE_ARCS else "steady"
+
+
+def sentence_arc_gain(arc: str | None, progress: float) -> float:
+    """Within-sentence amplitude envelope multiplier for ``progress`` in ``[0, 1]``."""
+    a = normalize_arc(arc)
+    p = _clamp(float(progress), 0.0, 1.0)
+    if a == "rise":
+        # Gradual buildup across the sentence (0.74x -> 1.08x)
+        return 0.74 + 0.34 * (0.5 - 0.5 * math.cos(math.pi * p))
+    if a == "surge":
+        # Cresting swell peaking around mid-sentence (0.80x -> 1.12x -> 0.88x)
+        crest = math.sin(math.pi * (p ** 0.82))
+        tail = 0.08 * (0.5 - 0.5 * math.cos(math.pi * p))
+        return 0.80 + 0.32 * crest + tail * (1.0 - crest)
+    if a == "ease":
+        # Gentle breath / softening across the sentence (1.00x -> 0.76x)
+        return 1.00 - 0.24 * (0.5 - 0.5 * math.cos(math.pi * p))
+    return 1.0
+
 
 def normalize_pattern(name: str | None) -> str:
     if not name:
@@ -249,13 +276,19 @@ def build_lovense_phrase(
     contrast_mode: str = "balanced",
     loop: bool = True,
     steps: int | None = None,
+    entry_norm: float | None = None,
+    arc: str = "steady",
+    duration_s: float | None = None,
 ) -> tuple[list[float], int, bool]:
     """Synthesize a 48–50 step Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``.
 
-    - When ``loop=True`` (all continuous patterns + Toy Studio ``Feel`` previews),
+    - When ``loop=True`` and ``entry_norm is None`` and ``arc == "steady"``,
       carrier cycles, contrast cycles, and dual-harmonic phrase modulation complete
       exact integer multiples across ``steps`` so the end wraps to ``steps[0]``
       seamlessly inside Lovense with ``timeSec: 0`` and ZERO refresh packets.
+    - When ``entry_norm`` or a shaped ``arc`` (``rise`` | ``surge`` | ``ease``) is
+      supplied for a Stage sentence cue, the opening ~0.75 s smoothly blends from
+      ``entry_norm`` into the sentence's arc contour timed to ``duration_s``.
     - When ``loop=False`` and ``pattern == "afterglow"`` (story wind-down),
       synthesizes a single 9.5 s decaying cosine phrase ending on ``0;0;0;0``.
     """
@@ -264,6 +297,7 @@ def build_lovense_phrase(
     use_pace = _clamp(spec["default_pace"] if pace is None else float(pace))
     norm_i = _clamp(float(intensity_norm), 0.0, 1.0)
     c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
+    use_arc = normalize_arc(arc)
     default_n = 48 if (loop and pat in ("heartbeat", "tease", "rhythm")) else 50
     n = max(16, min(50, default_n if steps is None else int(steps)))
 
@@ -292,7 +326,7 @@ def build_lovense_phrase(
         m_cycles = 1
         k_contrast = 6
     elif pat == "heartbeat":
-        # 4 paired LUB–DUB beats across 50 steps (~12.5 steps / ~1.7–2.0 s per heartbeat)
+        # 4 paired LUB–DUB beats across 48 steps (~12 steps / ~1.7–2.0 s per heartbeat)
         interval_ms = int(round(165 - 35 * use_pace))
         m_cycles = 4
         k_contrast = 8
@@ -314,10 +348,26 @@ def build_lovense_phrase(
         k_contrast = 6
 
     interval_ms = max(110, interval_ms)
+    shaped_sentence = (entry_norm is not None) or (use_arc != "steady")
+    phrase_dur_s = (n * interval_ms) / 1000.0
+    win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
+    ramp_s = 0.72
+    clamped_entry = None if entry_norm is None else _clamp(float(entry_norm), 0.0, 1.0)
+
     levels = []
     sub_offsets = (0.125, 0.375, 0.625, 0.875)
 
     for k in range(n):
+        if shaped_sentence:
+            t_k = ((k + 0.5) * interval_ms) / 1000.0
+            arc_prog = min(1.0, t_k / win_s)
+            local_i = _clamp(norm_i * sentence_arc_gain(use_arc, arc_prog), 0.0, 1.0)
+            if clamped_entry is not None and t_k < ramp_s:
+                blend = 0.5 - 0.5 * math.cos(math.pi * (t_k / ramp_s))
+                local_i = _clamp(clamped_entry * (1.0 - blend) + local_i * blend, 0.0, 1.0)
+        else:
+            local_i = norm_i
+
         acc = 0.0
         for off in sub_offsets:
             frac_u = (k + off) / n
@@ -332,12 +382,12 @@ def build_lovense_phrase(
                 phase,
                 frac_u,
                 c_phase,
-                norm_i,
+                local_i,
                 use_pace,
                 c_gain,
                 periodic_lfo=(m1, m2),
             )
-            acc += w * norm_i
+            acc += w * local_i
         levels.append(round(_clamp(acc / len(sub_offsets)), 4))
 
     return levels, interval_ms, True

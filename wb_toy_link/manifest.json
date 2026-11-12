@@ -1,7 +1,7 @@
 {
   "id": "wb_toy_link",
   "name": "Toy Link",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "icon": "🔗",
   "description": "Lovense haptics steered in real time by JEV with a procedural anti-numbing pattern engine. Configure your Lovense connection, feel presets, and dynamic patterns in Toy Studio.",
   "dependencies": [],
@@ -16,7 +16,7 @@
     "context_string": false,
     "messages": true
   },
-  "ui_slots": ["slot_sidebar"],
+  "ui_slots": ["slot_sidebar", "slot_header"],
   "commands": {
     "/toys": "on_command_toys"
   },

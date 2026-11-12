@@ -101,6 +101,11 @@ def set_services(services: dict) -> None:
         _store.config,
         _apply_jev_verdict,
         lambda: _vibe.strength,
+        get_current_vibe=lambda: {
+            "strength": _vibe.strength,
+            "pattern": _vibe.pattern,
+            "pace": _vibe.pace,
+        },
     )
 
     # If a Lovense host is already saved, probe in the background on startup
@@ -195,6 +200,7 @@ def _apply_jev_verdict(verdict: dict) -> None:
     _vibe.set_target(
         verdict.get("strength", 0.0),
         pat,
+        verdict.get("params"),
         source=f"jev:{pat}",
         pace=verdict.get("pace", 0.45),
     )
@@ -267,6 +273,12 @@ async def _apply_between_blocks_policy() -> None:
             pat = _director.pattern_override or "velvet"
             _vibe.set_target(target, pat, source="between:low", pace=0.28)
             _manager.ensure_running()
+        return
+
+    # mode == "continue": clear per-sentence arc flag so between-blocks rests on a pure steady loop
+    if _vibe.strength > 0.5 and _vibe.pattern != "afterglow" and _vibe.params.get("sentence_cue"):
+        _vibe.set_target(_vibe.strength, _vibe.pattern, {}, source=_vibe.source or "between:continue", pace=_vibe.pace)
+        _manager.ensure_running()
 
 
 def _schedule_between_blocks() -> None:
@@ -633,14 +645,16 @@ def get_router():
             try:
                 c_start = int(payload.get("char_start", 0))
                 c_end = int(payload.get("char_end", 0))
+                dur_ms = int(payload.get("duration_ms", 0))
             except (TypeError, ValueError):
-                c_start, c_end = 0, 0
+                c_start, c_end, dur_ms = 0, 0, 0
             text = str(payload.get("text") or "")
             verdict = await _director.on_reader_sentence(
                 sentence_index=idx,
                 char_start=c_start,
                 char_end=c_end,
                 text=text,
+                duration_ms=dur_ms,
             )
             return {"ok": True, "verdict": verdict, "status": _status()}
 
