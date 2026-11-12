@@ -131,22 +131,31 @@ async def test_disabled_or_no_host_sends_nothing():
 
 
 async def test_send_pattern_formats_rule_and_prevents_wraparound():
+    # 1. Looping pattern: timeSec=0, stopPrevious=0 -> native gapless hardware loop
     client, requests, _, _ = make_client()
-    await client.send_pattern([0.1, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 0.0], interval_ms=120)
+    await client.send_pattern([0.25, 0.5, 0.75, 0.5], interval_ms=135, loop=True)
     assert len(requests) == 1
+    loop_body = requests[0]
+    assert loop_body["command"] == "Pattern"
+    assert loop_body["rule"] == "V:1;F:;S:135#"
+    assert loop_body["timeSec"] == 0
+    assert loop_body["stopPrevious"] == 0
+    assert loop_body["apiVer"] == 2
+
+    # 2. One-shot pattern (loop=False): buffer span exceeds timeSec and ends on 0
+    requests.clear()
+    await client.send_pattern([0.1, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 0.0], interval_ms=120, loop=False)
     body = requests[0]
-    assert body["command"] == "Pattern"
-    assert body["rule"] == "V:1;F:;S:120#"
-    assert body["apiVer"] == 2
+    assert body["timeSec"] >= 1
+    assert body["stopPrevious"] == 0
     steps = [int(x) for x in body["strength"].split(";")]
     assert steps[:7] == [2, 5, 10, 15, 20, 10, 0]
-    # Buffer span exceeds timeSec and pads trailing zeros so it never wraps back to step 2
     assert len(steps) * 0.12 >= body["timeSec"]
     assert steps[-1] == 0
 
     # Vibrate-only mode sets F:v in rule
     v_client, v_requests, _, _ = make_client(dict(CFG, action_mode="Vibrate"))
-    await v_client.send_pattern([0.4, 0.6], interval_ms=120)
+    await v_client.send_pattern([0.4, 0.6], interval_ms=120, loop=True)
     assert v_requests[0]["rule"] == "V:1;F:v;S:120#"
 
 

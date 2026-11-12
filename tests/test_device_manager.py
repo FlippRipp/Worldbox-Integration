@@ -149,8 +149,8 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
             self.patterns = []
             self.stops = 0
 
-        async def send_pattern(self, levels, *, interval_ms=120, active_seconds=None):
-            self.patterns.append((list(levels), interval_ms, active_seconds))
+        async def send_pattern(self, levels, *, interval_ms=135, loop=True, active_seconds=None):
+            self.patterns.append((list(levels), interval_ms, loop, active_seconds))
 
         async def stop(self):
             self.stops += 1
@@ -165,18 +165,36 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
     manager = DeviceManager(vibe, [pclient], lambda: cfg, clock=clock)
 
     await manager.tick()
-    # A 3.2 s preview should emit ONLY ONE buffered Pattern payload, not 64 tick calls!
-    manager.start_preview(strength=75, pattern="afterglow", seconds=3.2)
-    await run_ticks(manager, clock, 60)  # 3.0 seconds @ 20 Hz
+    # 1. Default seconds=0 preview loops indefinitely in ONE packet (zero 4s refreshes!)
+    manager.start_preview(strength=75, pattern="afterglow", seconds=0)
+    await run_ticks(manager, clock, 400)  # 20 FULL SECONDS @ 20 Hz!
+    assert manager.preview_active is True
+    assert manager.status()["preview"]["looping"] is True
     assert len(pclient.patterns) == 1
-    levels, interval_ms, _ = pclient.patterns[0]
-    assert interval_ms == 120
-    assert len(levels) == 45
-    # Adjacent 120 ms steps in afterglow must glide smoothly (no sudden jumps)
+    levels, interval_ms, is_loop, _ = pclient.patterns[0]
+    assert is_loop is True
+    assert len(levels) == 50
     max_jump = max(abs(levels[i + 1] - levels[i]) for i in range(len(levels) - 1))
     assert max_jump < 0.14
 
-    # Once preview completes, Stop is sent once
-    await run_ticks(manager, clock, 10)
+    # Stopping explicitly cancels the looping preview and sends Stop once
+    await manager.instant_stop()
+    assert manager.preview_active is False
     assert pclient.stops == 1
+
+    # 2. Steady story pattern also sends ONLY ONE packet over 20s (zero 4s refreshes!)
+    pclient.patterns.clear()
+    vibe.set_target(82, "crest")
+    await run_ticks(manager, clock, 400)  # 20 FULL SECONDS @ 20 Hz!
+    assert len(pclient.patterns) == 1
+
+    # Tiny JEV jitter (< 4%) does not re-send or reset the hardware loop
+    vibe.set_target(84, "crest")
+    await run_ticks(manager, clock, 20)
+    assert len(pclient.patterns) == 1
+
+    # Meaningful JEV shift sends one clean update
+    vibe.set_target(50, "swell")
+    await run_ticks(manager, clock, 20)
+    assert len(pclient.patterns) == 2
 

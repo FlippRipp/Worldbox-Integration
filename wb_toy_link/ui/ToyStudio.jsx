@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import LovenseCard from './toystudio/LovenseCard';
 import SteeringCard from './toystudio/SteeringCard';
 import PatternGalleryCard from './toystudio/PatternGalleryCard';
@@ -12,6 +12,16 @@ export default function ToyStudio({ onBack }) {
   const [patterns, setPatterns] = useState([]);
   const [status, setStatus] = useState(null);
   const [error, setError] = useState('');
+  const previewActiveRef = useRef(false);
+  previewActiveRef.current = Boolean(status?.preview);
+
+  useEffect(() => {
+    return () => {
+      if (previewActiveRef.current) {
+        fetch(`${API}/stop`, { method: 'POST' }).catch(() => {});
+      }
+    };
+  }, []);
 
   const refreshStatus = useCallback(async () => {
     try {

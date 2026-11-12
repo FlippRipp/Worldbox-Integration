@@ -24,26 +24,33 @@ export default function PatternGalleryCard({
     saveConfig({ enabled_patterns: Array.from(set) });
   };
 
-  const triggerFeel = async (patId) => {
-    if (activePreview === patId) {
+  const triggerFeel = async (patId, bandOverride = null) => {
+    if (!bandOverride && activePreview === patId) {
       await fetch(`${api}/stop`, { method: 'POST' });
     } else {
-      const strength = previewBand === 'high' ? 88 : 56;
-      const seconds = patId === 'afterglow' ? 9.0 : 5.0;
+      const band = bandOverride || previewBand;
+      const strength = band === 'high' ? 88 : 56;
       await fetch(`${api}/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pattern: patId, strength, seconds }),
+        body: JSON.stringify({ pattern: patId, strength, seconds: 0 }),
       });
     }
     refresh();
+  };
+
+  const handleBandChange = (nextBand) => {
+    setPreviewBand(nextBand);
+    if (activePreview) {
+      triggerFeel(activePreview, nextBand);
+    }
   };
 
   const badge = (
     <div className="w-56">
       <Segmented
         value={previewBand}
-        onChange={setPreviewBand}
+        onChange={handleBandChange}
         options={[
           { id: 'moderate', label: 'Moderate (58%)' },
           { id: 'high', label: 'High (92%)' },

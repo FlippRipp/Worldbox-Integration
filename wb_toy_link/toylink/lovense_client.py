@@ -253,13 +253,15 @@ class LovenseClient:
         self,
         levels: list[float],
         *,
-        interval_ms: int = 120,
+        interval_ms: int = 135,
+        loop: bool = True,
         active_seconds: float | None = None,
     ) -> None:
         """Send a multi-step 0..20 ``Pattern`` timeline to Lovense.
 
-         Lovense executes the steps natively on its local timer at ``interval_ms``
-        spacing (>= 100 ms), completely eliminating per-tick Wi-Fi/BLE jitter.
+        When ``loop=True``, sends ``timeSec: 0`` and ``stopPrevious: 0`` so
+        Lovense loops the 50-step phrase natively in hardware with zero network
+        refreshes and zero ~4 s reset pauses.
         """
         if not self.enabled:
             return
@@ -274,29 +276,28 @@ class LovenseClient:
             await self.stop()
             return
 
-        # Compute timeSec strictly <= total buffer span so Lovense never wraps
-        # back to steps[0] at the end of a decaying tail or finite preview.
-        step_s = interval_ms / 1000.0
-        last_nonzero_idx = max(i for i, s in enumerate(steps) if s > 0)
-        nonzero_span_s = (last_nonzero_idx + 1) * step_s
-        if active_seconds is not None:
-            desired_s = min(float(active_seconds), len(steps) * step_s)
+        if loop:
+            time_sec = 0
         else:
-            desired_s = min(nonzero_span_s, len(steps) * step_s - 0.15)
-        time_sec = max(1, int(math.ceil(max(0.8, desired_s))))
-
-        # Ensure len(steps) * step_s >= time_sec + 0.12 (pad with 0 if finite tail,
-        # or repeat final value if continuous) so wrap-around to steps[0] is impossible.
-        min_steps = min(MAX_PATTERN_STEPS, int(math.ceil((time_sec + 0.15) / step_s)))
-        if len(steps) < min_steps:
-            pad_val = 0 if steps[-1] == 0 else steps[-1]
-            steps.extend([pad_val] * (min_steps - len(steps)))
+            step_s = interval_ms / 1000.0
+            last_nonzero_idx = max(i for i, s in enumerate(steps) if s > 0)
+            nonzero_span_s = (last_nonzero_idx + 1) * step_s
+            if active_seconds is not None:
+                desired_s = min(float(active_seconds), len(steps) * step_s)
+            else:
+                desired_s = min(nonzero_span_s, len(steps) * step_s - 0.15)
+            time_sec = max(1, int(math.ceil(max(0.8, desired_s))))
+            min_steps = min(MAX_PATTERN_STEPS, int(math.ceil((time_sec + 0.15) / step_s)))
+            if len(steps) < min_steps:
+                pad_val = 0 if steps[-1] == 0 else steps[-1]
+                steps.extend([pad_val] * (min_steps - len(steps)))
 
         payload = {
             "command": "Pattern",
             "rule": f"V:1;F:{self._pattern_features()};S:{interval_ms}#",
             "strength": ";".join(str(s) for s in steps),
             "timeSec": time_sec,
+            "stopPrevious": 0,
             "apiVer": 2,
         }
         await self._enqueue_or_send(("pattern", payload, steps[0], levels[0]))

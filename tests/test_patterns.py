@@ -115,3 +115,38 @@ def test_afterglow_decays_to_silence():
 def test_stateless_pattern_multiplier_helper():
     v = pattern_multiplier("heartbeat", 0.5, {"pace": 0.5})
     assert 0.0 <= v <= 1.0
+
+
+@pytest.mark.parametrize("pat", ["velvet", "swell", "heartbeat", "tease", "rhythm", "crest", "afterglow"])
+def test_build_lovense_phrase_loops_seamlessly_across_wrap(pat):
+    from toylink.patterns import build_lovense_phrase
+
+    levels, interval_ms, is_loop = build_lovense_phrase(
+        pat,
+        intensity_norm=0.85,
+        pace=0.55,
+        contrast_mode="balanced",
+        loop=True,
+    )
+    assert is_loop is True
+    assert len(levels) == 50
+    assert interval_ms >= 110
+    # Wrap seam from step 49 -> step 0 must be just as smooth as interior steps!
+    max_interior = max(abs(levels[i + 1] - levels[i]) for i in range(len(levels) - 1))
+    seam_jump = abs(levels[0] - levels[-1])
+    assert seam_jump <= max(0.12, max_interior + 0.03)
+
+
+def test_build_lovense_phrase_one_shot_afterglow_ends_on_zeros():
+    from toylink.patterns import build_lovense_phrase
+
+    levels, interval_ms, is_loop = build_lovense_phrase(
+        "afterglow",
+        intensity_norm=0.75,
+        loop=False,
+    )
+    assert is_loop is False
+    assert interval_ms == 190
+    assert len(levels) == 50
+    assert levels[-4:] == [0.0, 0.0, 0.0, 0.0]
+

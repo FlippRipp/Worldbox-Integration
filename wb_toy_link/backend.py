@@ -508,9 +508,9 @@ def get_router():
         except (TypeError, ValueError):
             strength = 65.0
         try:
-            seconds = float(payload.get("seconds", 4.0))
+            seconds = float(payload.get("seconds", 0.0))
         except (TypeError, ValueError):
-            seconds = 4.0
+            seconds = 0.0
         pace = payload.get("pace")
         _vibe.set_gate(True)
         _manager.ensure_running()

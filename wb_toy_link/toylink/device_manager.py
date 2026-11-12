@@ -1,14 +1,15 @@
 """The single 20 Hz control loop that owns oscillator state and device streams.
 
-Smoothness design:
-- Oscillator timing is 100% decoupled from network latency: ``run()`` advances on
-  a drift-free monotonic schedule and dispatches HTTP writes asynchronously.
-- Clients supporting ``send_pattern`` (``LovenseClient``) receive 45-step lookahead
-  curves at 120 ms step intervals (5.4 s buffer, refreshed every ~3.5 s or upon
-  JEV / manual state changes). Lovense clocks those steps locally over BLE with
-  zero Wi-Fi jitter.
-- Direct ``set_level`` clients receive un-quantized levels without an intermediate
-  float deadband that would beat against 0..20 integer rounding.
+Gapless Lovense playback design:
+- Instead of refreshing a short buffer every ~3.5 s (which caused Lovense to
+  reset its BLE stream and pause briefly on each refresh), ``LovenseClient``
+  receives a 50-step loop-seamless phrase once with ``timeSec: 0`` and
+  ``stopPrevious: 0``. Lovense loops the phrase natively in hardware with ZERO
+  periodic network refreshes until JEV or the user actually changes the state.
+- Story ``afterglow`` wind-downs send a single 9.5 s (50 × 190 ms) decaying
+  packet ending in zeros, also requiring zero mid-fade refreshes.
+- Toy Studio ``Feel`` previews default to ``seconds=0`` (looping indefinitely
+  until stopped or switched).
 """
 from __future__ import annotations
 
@@ -16,17 +17,12 @@ import asyncio
 import math
 import time
 
-from .patterns import PATTERN_SPECS, VibeState, normalize_pattern
+from .patterns import PATTERN_SPECS, VibeState, build_lovense_phrase, normalize_pattern
 
 KEEPALIVE_S = 0.85
-PATTERN_STEP_MS = 120
-PATTERN_STEP_S = PATTERN_STEP_MS / 1000.0
-PATTERN_WINDOW_STEPS = 45               # 45 * 120 ms = 5.40 s (< Lovense 50-step max)
-PATTERN_ACTIVE_S = 5.0                  # < 5.40 s so Lovense never wraps around to step 0
-PATTERN_REFRESH_S = 3.48                # refresh ~1.5 s before buffer expires
 MIN_CHANGE_RESEND_S = 0.12              # coalesce rapid manual slider drags
-PREVIEW_RAMP_MS = 380.0                 # silky entrance for previews
-PREVIEW_RELEASE_S = 0.90                # soft ~7.5-step cosine feather at end of preview
+PREVIEW_RAMP_MS = 350.0
+PREVIEW_RELEASE_S = 0.80
 
 RESPONSE_FEEL_RAMP_MS: dict[str, float] = {
     "silky": 900.0,
@@ -62,13 +58,17 @@ class DeviceManager:
         self._task: asyncio.Task | None = None
         self._io_tasks: set[asyncio.Task] = set()
 
-        # Buffered Pattern stream tracking
+        # Gapless hardware-loop stream tracking
         self._pattern_stream_active: bool = False
-        self._last_stream_sig: tuple | None = None
+        self._sent_mode_key: tuple | None = None
+        self._sent_eff_norm: float = -1.0
+        self._sent_pace: float = -1.0
         self._last_pattern_send_at: float = -999.0
 
-        # Conflict-free temporary preview state (for Test Buzz & Pattern Gallery)
+        # Conflict-free preview state (seconds <= 0 => loop until stopped)
         self._preview_id: int = 0
+        self._preview_loop: bool = False
+        self._preview_seconds: float = 0.0
         self._preview_until: float = 0.0
         self._preview_vibe: VibeState | None = None
         self._preview_envelope: float = 0.0
@@ -91,7 +91,7 @@ class DeviceManager:
             try:
                 await self.tick(now=now, background_io=True)
             except Exception:
-                pass  # loop must never die; client errors are caught internally
+                pass
             hz = float((self._get_config() or {}).get("tick_hz", 20) or 20)
             period = 1.0 / max(2.0, min(30.0, hz))
             next_tick = max(now + 0.005, next_tick + period)
@@ -104,7 +104,8 @@ class DeviceManager:
         return RESPONSE_FEEL_RAMP_MS.get(feel, 420.0)
 
     def _preview_feather(self, remaining_s: float) -> float:
-        """Gentle cosine fade-out on the last 360 ms of a preview when returning to silence."""
+        if self._preview_loop:
+            return 1.0
         if self.vibe.vibe_on and self.vibe.strength > 0.5:
             return 1.0
         if remaining_s >= PREVIEW_RELEASE_S:
@@ -122,12 +123,12 @@ class DeviceManager:
         cap = (float(cfg.get("master_cap_global", 100)) / 100.0) * (float(self.story_cap) / 100.0)
         cap = max(0.0, min(1.0, cap))
 
-        in_preview = self._preview_vibe is not None and now < self._preview_until
+        in_preview = self._preview_vibe is not None and (self._preview_loop or now < self._preview_until)
         if in_preview:
             pv = self._preview_vibe
             assert pv is not None
-            # Ramp smoothly in over 220 ms; follow afterglow's gentle decay downward
-            if pv.pattern == "afterglow" and self._preview_envelope > pv.strength:
+            auto_decay = not self._preview_loop
+            if auto_decay and pv.pattern == "afterglow" and self._preview_envelope > pv.strength:
                 self._preview_envelope = pv.strength
             else:
                 self._preview_envelope = _slew_step(
@@ -137,16 +138,16 @@ class DeviceManager:
                     PREVIEW_RAMP_MS,
                 )
             norm_i = (self._preview_envelope / 100.0) * cap
-            wave = pv.advance_and_sample(dt, norm_i, contrast_mode=contrast_mode)
-            if pv.pattern == "afterglow" and self._preview_envelope > pv.strength:
+            wave = pv.advance_and_sample(dt, norm_i, contrast_mode=contrast_mode, auto_decay=auto_decay)
+            if auto_decay and pv.pattern == "afterglow" and self._preview_envelope > pv.strength:
                 self._preview_envelope = pv.strength
             feather = self._preview_feather(self._preview_until - now)
             level = max(0.0, min(1.0, wave * norm_i * feather))
             self.current_level = level
-            sig = ("preview", self._preview_id, round(cap, 3), contrast_mode)
         else:
             if self._preview_vibe is not None:
                 self._preview_vibe = None
+                self._preview_loop = False
                 self._preview_envelope = 0.0
 
             target = self.vibe.strength if self.vibe.vibe_on else 0.0
@@ -166,109 +167,30 @@ class DeviceManager:
                     self.envelope = self.vibe.strength
             level = max(0.0, min(1.0, wave * norm_i))
             self.current_level = level
-            sig = (
-                "live",
-                self.vibe.version,
-                self.vibe.vibe_on,
-                round(cap, 3),
-                contrast_mode,
-                round(ramp_ms, 0),
-            )
 
         await self._transmit(
             level=level,
             now=now,
-            sig=sig,
+            in_preview=in_preview,
             cap=cap,
             contrast_mode=contrast_mode,
-            ramp_ms=ramp_ms,
             background_io=background_io,
         )
-
-    def _build_lookahead_window(
-        self,
-        *,
-        now: float,
-        lead_s: float,
-        cap: float,
-        contrast_mode: str,
-        ramp_ms: float,
-    ) -> tuple[list[float], float]:
-        """Simulate ``PATTERN_WINDOW_STEPS`` ahead at ``PATTERN_STEP_S`` (120 ms)
-        without mutating live oscillator state."""
-        sim_vibe = self.vibe.clone()
-        sim_env = self.envelope
-        sim_pv = self._preview_vibe.clone() if (self._preview_vibe is not None and now < self._preview_until) else None
-        sim_pv_env = self._preview_envelope
-        pv_until = self._preview_until
-        sim_t = now
-
-        def advance_sim(step_dt: float) -> float:
-            nonlocal sim_env, sim_pv, sim_pv_env, sim_t
-            sim_t += step_dt
-            if sim_pv is not None and sim_t < pv_until:
-                if sim_pv.pattern == "afterglow" and sim_pv_env > sim_pv.strength:
-                    sim_pv_env = sim_pv.strength
-                else:
-                    sim_pv_env = _slew_step(sim_pv_env, sim_pv.strength, step_dt, PREVIEW_RAMP_MS)
-                ni = (sim_pv_env / 100.0) * cap
-                w = sim_pv.advance_and_sample(step_dt, ni, contrast_mode=contrast_mode)
-                if sim_pv.pattern == "afterglow" and sim_pv_env > sim_pv.strength:
-                    sim_pv_env = sim_pv.strength
-                feather = self._preview_feather(pv_until - sim_t)
-                return max(0.0, min(1.0, w * ni * feather))
-
-            sim_pv = None
-            target = sim_vibe.strength if sim_vibe.vibe_on else 0.0
-            if not sim_vibe.vibe_on:
-                sim_env = 0.0
-            elif sim_vibe.pattern == "afterglow" and sim_env > target and target > 0.0:
-                sim_env = target
-            else:
-                sim_env = _slew_step(sim_env, target, step_dt, ramp_ms)
-            if sim_env <= 0.001:
-                return 0.0
-            ni = (sim_env / 100.0) * cap
-            w = sim_vibe.advance_and_sample(step_dt, ni, contrast_mode=contrast_mode)
-            if sim_vibe.pattern == "afterglow" and sim_env > sim_vibe.strength:
-                sim_env = sim_vibe.strength
-            return max(0.0, min(1.0, w * ni))
-
-        levels: list[float] = []
-        if lead_s > 0.002:
-            levels.append(round(advance_sim(lead_s), 4))
-        else:
-            levels.append(round(self.current_level, 4))
-        for _ in range(PATTERN_WINDOW_STEPS - 1):
-            levels.append(round(advance_sim(PATTERN_STEP_S), 4))
-
-        # Determine active duration: if the buffer decays to silence and stays 0,
-        # size active_seconds cleanly around the non-zero span.
-        nonzero_indices = [i for i, v in enumerate(levels) if v > 0.004]
-        if not nonzero_indices:
-            return levels, 0.0
-        last_nz = nonzero_indices[-1]
-        if last_nz < len(levels) - 3 and levels[-1] <= 0.004:
-            active_s = min(PATTERN_ACTIVE_S, (last_nz + 1) * PATTERN_STEP_S)
-        else:
-            active_s = PATTERN_ACTIVE_S
-        return levels, active_s
 
     async def _transmit(
         self,
         *,
         level: float,
         now: float,
-        sig: tuple,
+        in_preview: bool,
         cap: float,
         contrast_mode: str,
-        ramp_ms: float,
         background_io: bool,
     ) -> None:
         pattern_clients = [c for c in self.clients if getattr(c, "supports_pattern_stream", False)]
         direct_clients = [c for c in self.clients if not getattr(c, "supports_pattern_stream", False)]
 
-        # 1. Direct step clients (e.g. unit-test FakeClient or Function-mode fallback)
+        # 1. Direct step clients (unit-test FakeClient or Function-mode fallback)
         if direct_clients:
             if level <= 0.0005:
                 if self._last_sent > 0.0:
@@ -279,53 +201,130 @@ class DeviceManager:
                 self._last_send_time = now
                 await self._run_clients([c.set_level(level) for c in direct_clients], background_io)
 
-        # 2. Buffered Pattern-stream clients (Lovense)
+        # 2. Gapless Lovense Pattern-stream clients
         if not pattern_clients:
             return
 
-        active_output = (
-            (self._preview_vibe is not None and now < self._preview_until)
-            or (self.vibe.vibe_on and (self.vibe.strength > 0.5 or self.envelope > 0.1))
-        )
-        if not active_output and level <= 0.004:
-            if self._pattern_stream_active:
+        if in_preview and self._preview_vibe is not None:
+            pv = self._preview_vibe
+            eff_norm = max(0.0, min(1.0, (pv.strength / 100.0) * cap))
+            mode_key = ("preview", self._preview_id, round(cap, 3), contrast_mode)
+            if mode_key == self._sent_mode_key and self._pattern_stream_active:
+                return  # Already playing natively on Lovense — send ZERO refreshes!
+
+            if self._preview_loop:
+                levels, interval_ms, is_loop = build_lovense_phrase(
+                    pv.pattern,
+                    intensity_norm=eff_norm,
+                    pace=pv.pace,
+                    contrast_mode=contrast_mode,
+                    loop=True,
+                )
+                active_s = None
+            else:
+                # Finite preview (e.g. quick Test Buzz): fit entire preview into one 50-step packet
+                step_ms = max(110, int(math.ceil((self._preview_seconds * 1000.0) / 46.0)))
+                step_dt = step_ms / 1000.0
+                sim_pv = pv.clone()
+                sim_env = 0.0
+                levels = []
+                for k in range(50):
+                    t_k = (k + 1) * step_dt
+                    if t_k > self._preview_seconds:
+                        levels.append(0.0)
+                        continue
+                    sim_env = _slew_step(sim_env, sim_pv.strength, step_dt, PREVIEW_RAMP_MS)
+                    ni = (sim_env / 100.0) * cap
+                    w = sim_pv.advance_and_sample(step_dt, ni, contrast_mode=contrast_mode)
+                    rem = max(0.0, self._preview_seconds - t_k)
+                    feather = 1.0 if rem >= PREVIEW_RELEASE_S else (0.5 - 0.5 * math.cos(math.pi * (rem / PREVIEW_RELEASE_S)))
+                    levels.append(round(max(0.0, min(1.0, w * ni * feather)), 4))
+                interval_ms = step_ms
+                is_loop = False
+                active_s = self._preview_seconds
+
+            self._pattern_stream_active = True
+            self._sent_mode_key = mode_key
+            self._sent_eff_norm = eff_norm
+            self._sent_pace = pv.pace
+            self._last_pattern_send_at = now
+            await self._run_clients(
+                [
+                    c.send_pattern(levels, interval_ms=interval_ms, loop=is_loop, active_seconds=active_s)
+                    for c in pattern_clients
+                ],
+                background_io,
+            )
+            return
+
+        # Live Story / Manual state
+        target = self.vibe.strength if self.vibe.vibe_on else 0.0
+        if target <= 0.5:
+            # Wait for live envelope ramp-down before sending Stop once
+            if self.envelope <= 0.2 and self._pattern_stream_active:
                 self._pattern_stream_active = False
-                self._last_stream_sig = None
+                self._sent_mode_key = None
+                self._sent_eff_norm = -1.0
                 await self._run_clients([c.stop() for c in pattern_clients], background_io)
             return
 
-        sig_changed = sig != self._last_stream_sig
-        since_last = now - self._last_pattern_send_at
-        need_send = (
-            (not self._pattern_stream_active)
-            or (sig_changed and since_last >= MIN_CHANGE_RESEND_S)
-            or (since_last >= PATTERN_REFRESH_S)
-        )
-        if not need_send:
+        if self.vibe.pattern == "afterglow":
+            # One-shot 9.5s wind-down: send ONCE per latch, never refresh mid-decay
+            start_i = self.vibe._afterglow_start_strength or target
+            eff_norm = max(0.0, min(1.0, (start_i / 100.0) * cap))
+            mode_key = ("afterglow", round(self.vibe.latched_at, 3), round(cap, 3), contrast_mode)
+            if mode_key == self._sent_mode_key and self._pattern_stream_active:
+                return
+            levels, interval_ms, _ = build_lovense_phrase(
+                "afterglow",
+                intensity_norm=eff_norm,
+                pace=self.vibe.pace,
+                contrast_mode=contrast_mode,
+                loop=False,
+            )
+            self._pattern_stream_active = True
+            self._sent_mode_key = mode_key
+            self._sent_eff_norm = eff_norm
+            self._sent_pace = self.vibe.pace
+            self._last_pattern_send_at = now
+            await self._run_clients(
+                [
+                    c.send_pattern(levels, interval_ms=interval_ms, loop=False, active_seconds=9.2)
+                    for c in pattern_clients
+                ],
+                background_io,
+            )
             return
 
-        avg_rtt = sum(float(getattr(c, "last_rtt_s", 0.02)) for c in pattern_clients) / len(pattern_clients)
-        lead_s = min(0.12, max(0.0, avg_rtt * 0.5)) if self._pattern_stream_active else 0.0
-        levels, active_s = self._build_lookahead_window(
-            now=now,
-            lead_s=lead_s,
-            cap=cap,
+        # Steady continuous pattern: loop natively in hardware (timeSec: 0) with zero refreshes!
+        eff_norm = max(0.0, min(1.0, (target / 100.0) * cap))
+        mode_key = ("loop", self.vibe.pattern, contrast_mode)
+        same_loop = (
+            self._pattern_stream_active
+            and mode_key == self._sent_mode_key
+            and abs(eff_norm - self._sent_eff_norm) < 0.042
+            and abs(self.vibe.pace - self._sent_pace) < 0.14
+        )
+        if same_loop:
+            return
+        if (now - self._last_pattern_send_at) < MIN_CHANGE_RESEND_S and self._pattern_stream_active:
+            return
+
+        levels, interval_ms, _ = build_lovense_phrase(
+            self.vibe.pattern,
+            intensity_norm=eff_norm,
+            pace=self.vibe.pace,
             contrast_mode=contrast_mode,
-            ramp_ms=ramp_ms,
+            loop=True,
         )
-        if active_s <= 0.0:
-            if self._pattern_stream_active:
-                self._pattern_stream_active = False
-                self._last_stream_sig = None
-                await self._run_clients([c.stop() for c in pattern_clients], background_io)
-            return
-
         self._pattern_stream_active = True
-        self._last_stream_sig = sig
+        self._sent_mode_key = mode_key
+        self._sent_eff_norm = eff_norm
+        self._sent_pace = self.vibe.pace
         self._last_pattern_send_at = now
         await self._run_clients(
             [
-                c.send_pattern(levels, interval_ms=PATTERN_STEP_MS, active_seconds=active_s)
+                c.send_pattern(levels, interval_ms=interval_ms, loop=True)
                 for c in pattern_clients
             ],
             background_io,
@@ -343,7 +342,8 @@ class DeviceManager:
 
     async def _send_stop(self) -> None:
         self._pattern_stream_active = False
-        self._last_stream_sig = None
+        self._sent_mode_key = None
+        self._sent_eff_norm = -1.0
         for client in self.clients:
             await client.stop()
 
@@ -353,10 +353,10 @@ class DeviceManager:
         self,
         strength: float = 55.0,
         pattern: str = "velvet",
-        seconds: float = 4.8,
+        seconds: float = 0.0,
         pace: float | None = None,
     ) -> None:
-        """Run a temporary pattern/test preview cleanly inside the loop."""
+        """Start a pattern preview. ``seconds <= 0`` loops indefinitely until stopped."""
         pat = normalize_pattern(pattern)
         pv = VibeState(clock=self._clock)
         pv.set_target(
@@ -368,17 +368,26 @@ class DeviceManager:
         self._preview_id += 1
         self._preview_vibe = pv
         self._preview_envelope = min(self.envelope, pv.strength)
-        self._preview_until = self._clock() + max(0.5, min(30.0, float(seconds)))
-        # Reset debounce timer so an explicit user click dispatches on the very next tick
+        sec = float(seconds or 0.0)
+        if sec <= 0.0:
+            self._preview_loop = True
+            self._preview_seconds = 0.0
+            self._preview_until = math.inf
+        else:
+            self._preview_loop = False
+            self._preview_seconds = max(0.5, min(30.0, sec))
+            self._preview_until = self._clock() + self._preview_seconds
         self._last_pattern_send_at = -999.0
 
     async def test_buzz(self, strength: float = 55.0, seconds: float = 2.4, pattern: str = "swell") -> None:
-        """Schedule a smooth test swell preview via the loop."""
+        """Schedule a short finite test swell preview (for Connection Test button)."""
         self.start_preview(strength=strength, pattern=pattern, seconds=seconds)
 
     async def instant_stop(self) -> None:
         """Hard stop: cancel any preview, clear latch, zero output immediately."""
         self._preview_vibe = None
+        self._preview_loop = False
+        self._preview_seconds = 0.0
         self._preview_until = 0.0
         self._preview_envelope = 0.0
         self.vibe.clear(source="manual")
@@ -392,6 +401,7 @@ class DeviceManager:
         self.vibe.set_gate(on)
         if not on:
             self._preview_vibe = None
+            self._preview_loop = False
             self._preview_until = 0.0
             self.envelope = 0.0
             self.current_level = 0.0
@@ -402,7 +412,7 @@ class DeviceManager:
 
     @property
     def preview_active(self) -> bool:
-        return self._preview_vibe is not None and self._clock() < self._preview_until
+        return self._preview_vibe is not None and (self._preview_loop or self._clock() < self._preview_until)
 
     def status(self) -> dict:
         preview = None
@@ -410,7 +420,8 @@ class DeviceManager:
             preview = {
                 "pattern": self._preview_vibe.pattern,
                 "strength": round(self._preview_vibe.strength, 1),
-                "remaining_s": round(max(0.0, self._preview_until - self._clock()), 1),
+                "looping": self._preview_loop,
+                "remaining_s": None if self._preview_loop else round(max(0.0, self._preview_until - self._clock()), 1),
             }
         return {
             "level": round(self.current_level, 3),
