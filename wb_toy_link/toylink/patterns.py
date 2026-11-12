@@ -7,28 +7,30 @@ Design principles:
    golden-ratio dual-LFO phrase envelope (~9 s and ~14.5 s), so locally the
    rhythm is coherent and readable while globally no two 10 s windows repeat
    mechanically.
-3. Anti-numbing High↔Medium contrast: sustained flat high amplitude quickly
-   numbs mechanoreceptors, while dropping to 0% loses physical momentum. As
-   intensity approaches the high zone (and natively in ``crest``), patterns
-   lift deep troughs toward Medium (~46–56%) and cycle briskly (~1.8–3.3 Hz,
-   tuned to physical Lovense motor inertia on a 20 Hz loop) between High and
-   Medium to maximize contrast without numbing.
+3. BLE-aligned High↔Medium contrast: sustained flat high amplitude numbs
+   mechanoreceptors, while dropping to 0% loses physical momentum. As intensity
+   approaches the high zone (and natively in ``crest``), patterns lift deep
+   troughs toward Medium (~46–56%) and cycle briskly (~0.95–1.42 Hz, giving 6–9
+   clean 120 ms BLE steps per cycle and ~360–500 ms per half-cycle for physical
+   Lovense motor spin-up/down) between High and Medium to apply crisp contrast
+   without aliasing or numbing.
 """
 from __future__ import annotations
 
+import copy
 import math
 import time
 
 TAU = 2.0 * math.pi
 PHI = 1.618033988749895
 XFADE_S = 0.35
-AFTERGLOW_DECAY_S = 9.0
+AFTERGLOW_DECAY_S = 9.5
 
 PATTERN_SPECS: dict[str, dict] = {
     "velvet": {
         "id": "velvet",
         "label": "Velvet",
-        "tagline": "Warm continuous caress that breathes softly; shimmers at high intensity.",
+        "tagline": "Warm continuous caress that breathes softly; pulses High↔Medium when intense.",
         "default_pace": 0.35,
     },
     "swell": {
@@ -46,25 +48,25 @@ PATTERN_SPECS: dict[str, dict] = {
     "tease": {
         "id": "tease",
         "label": "Tease & Edge",
-        "tagline": "Climbing steps that flutter at the brink, pause, then build again.",
+        "tagline": "Climbing swells that hover at the brink, hush softly, then build again.",
         "default_pace": 0.50,
     },
     "rhythm": {
         "id": "rhythm",
         "label": "Rhythm",
-        "tagline": "Punchy physical cadence with 4-beat accents and high-speed drive.",
+        "tagline": "Fluid physical cadence with 4-beat accents and deep drive.",
         "default_pace": 0.60,
     },
     "crest": {
         "id": "crest",
         "label": "Crest Surge",
-        "tagline": "Rapid High↔Medium contrast surges riding a deep wave — peak intensity, zero numbing.",
-        "default_pace": 0.80,
+        "tagline": "Brisk High↔Medium contrast surges riding a deep wave — peak intensity, zero numbing.",
+        "default_pace": 0.78,
     },
     "afterglow": {
         "id": "afterglow",
         "label": "Afterglow",
-        "tagline": "Slow, warm fading waves that gently wind down to silence.",
+        "tagline": "Slow, silky cosine waves that gently wind down to silence.",
         "default_pace": 0.25,
     },
 }
@@ -104,35 +106,36 @@ def _smoothstep(edge0: float, edge1: float, x: float) -> float:
 
 
 def _carrier_hz(pattern: str, pace: float, m1: float, hi_blend: float) -> float:
-    """Instantaneous carrier frequency in Hz for a pattern."""
-    rubato = 1.0 + 0.12 * m1
+    """Instantaneous carrier frequency in Hz, tuned below BLE's 120 ms Nyquist."""
+    rubato = 1.0 + 0.10 * m1
     if pattern == "velvet":
-        return (0.45 + 0.55 * pace) * rubato
+        return (0.30 + 0.38 * pace) * rubato
     if pattern == "swell":
-        return (0.24 + 0.48 * pace) * rubato
+        return (0.20 + 0.28 * pace) * rubato
     if pattern == "heartbeat":
-        return (0.62 + 0.85 * pace + 0.28 * hi_blend) * rubato
+        return (0.50 + 0.42 * pace + 0.14 * hi_blend) * rubato
     if pattern == "tease":
-        # 8 beats per tease phrase -> ~0.75-1.5 beats/s => ~6-11 s full phrase
-        return (0.72 + 0.78 * pace) * rubato
+        # 8 beats per tease phrase -> ~0.55-1.10 beats/s => ~7-14 s full phrase
+        return (0.55 + 0.55 * pace) * rubato
     if pattern == "rhythm":
-        return (0.82 + 1.55 * pace + 0.55 * hi_blend) * rubato
+        return (0.62 + 0.72 * pace + 0.18 * hi_blend) * rubato
     if pattern == "crest":
-        return (2.15 + 1.10 * pace) * rubato
+        return (1.02 + 0.40 * pace) * rubato
     if pattern == "afterglow":
-        return (0.22 + 0.22 * pace) * (1.0 + 0.08 * m1)
-    return 0.5
+        return (0.18 + 0.14 * pace) * (1.0 + 0.06 * m1)
+    return 0.45
+
+
+def _contrast_hz(pace: float, m1: float) -> float:
+    """BLE-friendly High↔Medium contrast rate (~0.95–1.38 Hz = 6–9 steps/cycle @ 120 ms)."""
+    return (0.95 + 0.42 * pace) * (1.0 + 0.10 * m1)
 
 
 def _contrast_osc(contrast_phase: float, m2: float) -> float:
-    """Rapid High↔Medium anti-numbing wave in [mid_floor, 1.0].
-
-    Cycles cleanly between full peak (1.0) and a breathing Medium floor
-    (~0.44-0.56) so high intensities feel electric and punchy rather than flat.
-    """
-    mid_floor = 0.49 + 0.06 * m2
-    raw = 0.5 + 0.5 * math.sin(TAU * contrast_phase)
-    shaped = raw ** 0.82  # slightly fuller peak dwell for motor spin-up
+    """Smooth High↔Medium anti-numbing wave in [mid_floor, 1.0]."""
+    mid_floor = 0.48 + 0.06 * m2
+    raw = 0.5 - 0.5 * math.cos(TAU * contrast_phase)
+    shaped = raw ** 0.85
     return mid_floor + (1.0 - mid_floor) * shaped
 
 
@@ -159,77 +162,74 @@ def _eval_single(
 
     if pattern == "velvet":
         warm = 0.76 + 0.16 * breath + 0.08 * math.sin(TAU * u)
-        # At high intensity, shimmer briskly between High and Medium to prevent numbing
-        val = warm * (1.0 - 0.68 * hi_blend) + c_wave * (0.68 * hi_blend)
+        val = warm * (1.0 - 0.70 * hi_blend) + c_wave * (0.70 * hi_blend)
         return _clamp(val)
 
     if pattern == "swell":
-        skew = 0.64 + 0.08 * m1  # slow rise, quicker warm release
+        skew = 0.62 + 0.07 * m1
         if u < skew:
             s = 0.5 - 0.5 * math.cos(math.pi * (u / skew))
         else:
             s = 0.5 + 0.5 * math.cos(math.pi * ((u - skew) / (1.0 - skew)))
-        valley = 0.24 + 0.16 * breath + 0.18 * hi_blend
+        valley = 0.24 + 0.14 * breath + 0.20 * hi_blend
         peak = 0.88 + 0.12 * breath
         swell_val = valley + (peak - valley) * s
-        # Shimmer the upper crest with High↔Medium contrast when intense
-        crest_mask = s * hi_blend * 0.65
+        crest_mask = s * hi_blend * 0.68
         return _clamp(swell_val * (1.0 - crest_mask) + c_wave * crest_mask)
 
     if pattern == "heartbeat":
-        # Paired lub-dub Gaussian pulses over a warm breathing floor
-        lub = math.exp(-(((u - 0.15) / 0.075) ** 2)) * (0.82 + 0.08 * breath)
-        dub = math.exp(-(((u - 0.37) / 0.090) ** 2)) * 1.0
+        # Broad lub-dub Gaussian pulses so every beat spans multiple 120 ms BLE steps
+        lub = math.exp(-(((u - 0.18) / 0.120) ** 2)) * (0.84 + 0.08 * breath)
+        dub = math.exp(-(((u - 0.45) / 0.140) ** 2)) * 1.0
         beat = max(lub, dub)
         floor = 0.22 + 0.08 * m2 + 0.24 * hi_blend
         hb = floor + (1.0 - floor) * beat
         return _clamp(hb * (1.0 - 0.30 * hi_blend) + c_wave * (0.30 * hi_blend))
 
     if pattern == "tease":
-        # 8-beat phrase: 5.4 beats climbing steps -> 1.3 beats rapid brink -> 1.3 beats hush
+        # Continuous C1-blended 8-beat phrase: climbing swells -> brink -> soft hush
         bar = (phase % 8.0) / 8.0
-        if bar < 0.68:
-            prog = bar / 0.68
-            step_wave = 0.5 - 0.5 * math.cos(TAU * u)
-            ceil = 0.48 + 0.52 * (prog ** 0.9)
-            floor = 0.18 + 0.28 * prog
-            return _clamp(floor + (ceil - floor) * (step_wave ** 0.75))
-        if bar < 0.85:
-            # Hover right at the brink with rapid High↔Medium contrast
-            return _clamp(c_wave * (0.94 + 0.06 * m1))
-        # Tantalizing pull-back breath before next climb
-        release = _smoothstep(0.85, 0.91, bar) * (1.0 - _smoothstep(0.95, 1.0, bar))
-        hush = 0.12 + 0.12 * hi_blend + 0.05 * breath
-        return _clamp(hush + 0.12 * (1.0 - release))
+        prog = _clamp(bar / 0.68)
+        step_wave = 0.5 - 0.5 * math.cos(TAU * u)
+        ceil = 0.48 + 0.52 * (prog ** 0.9)
+        floor = 0.18 + 0.28 * prog
+        climb_val = _clamp(floor + (ceil - floor) * (step_wave ** 0.80))
+        brink_val = _clamp(c_wave * (0.94 + 0.06 * m1))
+        hush_val = _clamp(0.16 + 0.12 * hi_blend + 0.06 * breath)
+
+        to_brink = _smoothstep(0.64, 0.71, bar)
+        to_hush = _smoothstep(0.83, 0.89, bar)
+        re_enter = _smoothstep(0.95, 1.00, bar)
+
+        mid = climb_val * (1.0 - to_brink) + brink_val * to_brink
+        hushed = mid * (1.0 - to_hush) + hush_val * to_hush
+        # Ease smoothly back into start of next climb at bar -> 1.0
+        start_climb = 0.18
+        return _clamp(hushed * (1.0 - re_enter) + start_climb * re_enter)
 
     if pattern == "rhythm":
         bar_beat = int(math.floor(phase)) % 4
         accent = 1.0 if bar_beat == 3 else (0.88 + 0.10 * breath)
-        attack_frac = 0.38 - 0.06 * pace
+        attack_frac = 0.42 - 0.05 * pace
         if u < attack_frac:
-            stroke = math.sin(0.5 * math.pi * (u / attack_frac))
+            stroke = 0.5 - 0.5 * math.cos(math.pi * (u / attack_frac))
         else:
             rem = (u - attack_frac) / (1.0 - attack_frac)
-            stroke = 0.5 + 0.5 * math.cos(math.pi * (rem ** 0.85))
-        # Lift floor from deep stroke (0.24) to crisp Medium (~0.50) at high intensity
+            stroke = 0.5 + 0.5 * math.cos(math.pi * rem)
         floor = 0.24 + 0.26 * hi_blend + 0.05 * m2
-        val = floor + (accent - floor) * stroke
-        return _clamp(val)
+        return _clamp(floor + (accent - floor) * stroke)
 
     if pattern == "crest":
-        # Dedicated high-intensity contrast surge: rapid High↔Medium cycle riding a
-        # 5-second macro wave so contrast stays sharp and never numbs.
-        macro = 0.82 + 0.18 * (0.5 - 0.5 * math.cos(TAU * (phrase_phase * 1.65)))
-        # Alternate slightly fuller bursts every few cycles for organic excitement
-        carrier_mod = 0.5 + 0.5 * math.sin(TAU * u)
-        mid_floor = 0.44 + 0.12 * breath
-        fast = mid_floor + (1.0 - mid_floor) * (carrier_mod ** 0.80)
+        macro = 0.84 + 0.16 * (0.5 - 0.5 * math.cos(TAU * (phrase_phase * 1.5)))
+        carrier_mod = 0.5 - 0.5 * math.cos(TAU * u)
+        mid_floor = 0.46 + 0.10 * breath
+        fast = mid_floor + (1.0 - mid_floor) * (carrier_mod ** 0.82)
         return _clamp(fast * macro)
 
     if pattern == "afterglow":
+        # Pure, silky cosine swell with zero spike glitches, fading smoothly to silence
         gentle_swell = 0.5 - 0.5 * math.cos(TAU * u)
-        echo = 0.18 * math.exp(-(((u - 0.28) / 0.10) ** 2))
-        return _clamp(0.22 + 0.65 * gentle_swell * (0.75 + 0.25 * breath) + echo)
+        return _clamp(0.20 + 0.78 * gentle_swell * (0.85 + 0.15 * breath))
 
     return 1.0
 
@@ -237,8 +237,8 @@ def _eval_single(
 def sample_pattern_curve(
     pattern: str,
     *,
-    duration_s: float = 6.0,
-    steps: int = 96,
+    duration_s: float = 8.0,
+    steps: int = 120,
     intensity: float = 80.0,
     pace: float | None = None,
     contrast_mode: str = "balanced",
@@ -247,31 +247,17 @@ def sample_pattern_curve(
     pat = normalize_pattern(pattern)
     spec = PATTERN_SPECS[pat]
     use_pace = _clamp(spec["default_pace"] if pace is None else float(pace))
-    c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
     steps = max(8, int(steps))
     dt = max(0.01, float(duration_s) / steps)
 
-    phase = 0.0
-    phrase_phase = 0.12  # start slightly into a phrase so preview shows rich shape
-    contrast_phase = 0.0
-    strength = _clamp(float(intensity), 0.0, 100.0)
+    vs = VibeState()
+    vs.set_target(intensity, pat, pace=use_pace, source="sample")
+    vs.phrase_phase = 0.12
     samples: list[float] = []
-
     for _ in range(steps):
-        norm_i = strength / 100.0
-        m1 = math.sin(TAU * phrase_phase)
-        thresh = 0.52 if c_gain > 1.1 else 0.62
-        hi_blend = _clamp(_clamp((norm_i - thresh) / max(0.15, 1.0 - thresh)) * c_gain)
-
-        w = _eval_single(pat, phase, phrase_phase, contrast_phase, norm_i, use_pace, c_gain)
-        samples.append(round(w * norm_i, 4))
-
-        phase += dt * _carrier_hz(pat, use_pace, m1, hi_blend)
-        phrase_phase += dt * (0.105 + 0.045 * use_pace)
-        contrast_phase += dt * (2.05 + 1.15 * use_pace) * (1.0 + 0.14 * m1)
-        if pat == "afterglow":
-            strength = max(0.0, strength - (100.0 * dt / AFTERGLOW_DECAY_S))
-
+        norm_i = vs.strength / 100.0
+        w = vs.advance_and_sample(dt, norm_i, contrast_mode=contrast_mode)
+        samples.append(round(_clamp(w * (vs.strength / 100.0)), 4))
     return samples
 
 
@@ -293,12 +279,12 @@ def pattern_multiplier(
     thresh = 0.52 if c_gain > 1.1 else 0.62
     hi_blend = _clamp(_clamp((intensity_norm - thresh) / max(0.15, 1.0 - thresh)) * c_gain)
     phase = max(0.0, t) * _carrier_hz(pat, pace, m1, hi_blend)
-    contrast_phase = max(0.0, t) * (2.05 + 1.15 * pace) * (1.0 + 0.14 * m1)
+    contrast_phase = max(0.0, t) * _contrast_hz(pace, m1)
     return _eval_single(pat, phase, phrase_phase, contrast_phase, intensity_norm, pace, c_gain)
 
 
 class VibeState:
-    """Latched target and continuous oscillator state read by the 20 Hz loop.
+    """Latched target and continuous oscillator state.
 
     Updating strength or pace preserves oscillator phase so streaming JEV
     updates glide seamlessly; changing pattern crossfades over ``XFADE_S``.
@@ -323,6 +309,12 @@ class VibeState:
         self._xfade: float = 1.0
         self._afterglow_start_strength: float = 0.0
 
+    def clone(self) -> VibeState:
+        """Fast side-effect-free copy used to sample ahead-of-time Pattern buffers."""
+        dup = copy.copy(self)
+        dup.params = dict(self.params)
+        return dup
+
     def set_target(
         self,
         strength: float,
@@ -341,14 +333,12 @@ class VibeState:
 
         was_silent = self.strength <= 0.5
         if was_silent and new_strength > 0.5:
-            # Fresh start from silence: start cleanly at beginning of swell/phrase
             self.phase = 0.0
             self.phrase_phase = 0.0
             self.contrast_phase = 0.0
             self._prev_pattern = None
             self._xfade = 1.0
         elif new_pat != self.pattern and not was_silent:
-            # Smooth crossfade between active patterns without phase discontinuity
             self._prev_pattern = self.pattern
             self._xfade = 0.0
 
@@ -385,17 +375,7 @@ class VibeState:
             self.vibe_on = bool(on)
             self.version += 1
 
-    def advance_and_sample(
-        self,
-        dt: float,
-        intensity_norm: float,
-        contrast_mode: str = "balanced",
-    ) -> float:
-        """Advance oscillators by ``dt`` seconds and return waveform in [0, 1]."""
-        dt = max(0.0, float(dt))
-        c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
-
-        # Gentle automatic wind-down when in afterglow
+    def _step_once(self, dt: float, intensity_norm: float, c_gain: float) -> float:
         if self.pattern == "afterglow" and self.strength > 0.0 and dt > 0.0:
             rate = max(6.0, self._afterglow_start_strength or 50.0) / AFTERGLOW_DECAY_S
             self.strength = max(0.0, self.strength - rate * dt)
@@ -437,14 +417,34 @@ class VibeState:
         if dt > 0.0:
             self.phase += dt * _carrier_hz(self.pattern, self.pace, m1, hi_blend)
             self.phrase_phase += dt * (0.105 + 0.045 * self.pace)
-            self.contrast_phase += dt * (2.05 + 1.15 * self.pace) * (1.0 + 0.14 * m1)
-            # Keep floats well-conditioned over multi-hour sessions
+            self.contrast_phase += dt * _contrast_hz(self.pace, m1)
             if self.phase > 1e6:
                 self.phase %= 8.0
             if self.contrast_phase > 1e6:
                 self.contrast_phase %= 1.0
 
         return w
+
+    def advance_and_sample(
+        self,
+        dt: float,
+        intensity_norm: float,
+        contrast_mode: str = "balanced",
+    ) -> float:
+        """Advance oscillators by ``dt`` seconds with anti-aliased sub-stepping."""
+        dt = max(0.0, float(dt))
+        c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
+        if dt <= 0.04:
+            return self._step_once(dt, intensity_norm, c_gain)
+
+        # Sub-step larger intervals (e.g. 120 ms Lovense Pattern steps) so narrow
+        # features like heartbeat lub-dub are cleanly box-filtered, never aliased.
+        sub_n = min(8, max(2, math.ceil(dt / 0.03)))
+        sub_dt = dt / sub_n
+        acc = 0.0
+        for _ in range(sub_n):
+            acc += self._step_once(sub_dt, intensity_norm, c_gain)
+        return acc / sub_n
 
     def snapshot(self) -> dict:
         spec = PATTERN_SPECS.get(self.pattern, PATTERN_SPECS["velvet"])

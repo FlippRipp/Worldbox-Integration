@@ -135,3 +135,48 @@ async def test_caps_multiply_and_feel_presets_work():
     await run_ticks(manager, clock, 6)        # snappy 140 ms ramp finishes in 300 ms
     assert manager.envelope == 100.0
     assert client.levels[-1] <= 0.25 + 1e-4
+
+
+async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
+    class FakePatternClient:
+        name = "lovense"
+        enabled = True
+        connected = True
+        supports_pattern_stream = True
+        last_rtt_s = 0.02
+
+        def __init__(self):
+            self.patterns = []
+            self.stops = 0
+
+        async def send_pattern(self, levels, *, interval_ms=120, active_seconds=None):
+            self.patterns.append((list(levels), interval_ms, active_seconds))
+
+        async def stop(self):
+            self.stops += 1
+
+        def status(self):
+            return {"name": self.name}
+
+    clock = FakeClock()
+    vibe = VibeState(clock=clock)
+    pclient = FakePatternClient()
+    cfg = dict(CONFIG)
+    manager = DeviceManager(vibe, [pclient], lambda: cfg, clock=clock)
+
+    await manager.tick()
+    # A 3.2 s preview should emit ONLY ONE buffered Pattern payload, not 64 tick calls!
+    manager.start_preview(strength=75, pattern="afterglow", seconds=3.2)
+    await run_ticks(manager, clock, 60)  # 3.0 seconds @ 20 Hz
+    assert len(pclient.patterns) == 1
+    levels, interval_ms, _ = pclient.patterns[0]
+    assert interval_ms == 120
+    assert len(levels) == 45
+    # Adjacent 120 ms steps in afterglow must glide smoothly (no sudden jumps)
+    max_jump = max(abs(levels[i + 1] - levels[i]) for i in range(len(levels) - 1))
+    assert max_jump < 0.14
+
+    # Once preview completes, Stop is sent once
+    await run_ticks(manager, clock, 10)
+    assert pclient.stops == 1
+

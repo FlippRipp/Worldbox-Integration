@@ -29,10 +29,11 @@ export default function PatternGalleryCard({
       await fetch(`${api}/stop`, { method: 'POST' });
     } else {
       const strength = previewBand === 'high' ? 88 : 56;
+      const seconds = patId === 'afterglow' ? 9.0 : 5.0;
       await fetch(`${api}/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pattern: patId, strength, seconds: 4.5 }),
+        body: JSON.stringify({ pattern: patId, strength, seconds }),
       });
     }
     refresh();

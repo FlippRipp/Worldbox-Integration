@@ -128,3 +128,45 @@ async def test_disabled_or_no_host_sends_nothing():
     client2, requests2, _, _ = make_client(dict(CFG, host=""))
     await client2.set_level(0.5)
     assert requests2 == []
+
+
+async def test_send_pattern_formats_rule_and_prevents_wraparound():
+    client, requests, _, _ = make_client()
+    await client.send_pattern([0.1, 0.25, 0.5, 0.75, 1.0, 0.5, 0.0, 0.0], interval_ms=120)
+    assert len(requests) == 1
+    body = requests[0]
+    assert body["command"] == "Pattern"
+    assert body["rule"] == "V:1;F:;S:120#"
+    assert body["apiVer"] == 2
+    steps = [int(x) for x in body["strength"].split(";")]
+    assert steps[:7] == [2, 5, 10, 15, 20, 10, 0]
+    # Buffer span exceeds timeSec and pads trailing zeros so it never wraps back to step 2
+    assert len(steps) * 0.12 >= body["timeSec"]
+    assert steps[-1] == 0
+
+    # Vibrate-only mode sets F:v in rule
+    v_client, v_requests, _, _ = make_client(dict(CFG, action_mode="Vibrate"))
+    await v_client.send_pattern([0.4, 0.6], interval_ms=120)
+    assert v_requests[0]["rule"] == "V:1;F:v;S:120#"
+
+
+async def test_send_pattern_falls_back_to_function_if_bridge_rejects_pattern():
+    sent = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        sent.append(body)
+        if body.get("command") == "Pattern":
+            return httpx.Response(200, json={"code": 400, "type": "Unsupported Command"})
+        return httpx.Response(200, json={"code": 200, "data": {}})
+
+    client, _, _, _ = make_client(handler=handler)
+    await client.probe(auto_discover=False)
+    assert client.connected is True
+    assert client.supports_pattern_stream is True
+
+    await client.send_pattern([0.5, 0.6, 0.7], interval_ms=120)
+    assert client.supports_pattern_stream is False
+    assert sent[-1]["command"] == "Function"
+    assert sent[-1]["action"] == "All:10"
+

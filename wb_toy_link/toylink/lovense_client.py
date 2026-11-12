@@ -4,20 +4,22 @@ Supports both Lovense Remote on iOS/Android (LAN IP) and Lovense Connect on PC
 (127.0.0.1), over either HTTP (ports 20010 / 34567) or local HTTPS with
 Lovense's self-signed Game Mode certificate (ports 30010 / 34568).
 
-Key reliability details:
-- Step deduplication & coalescing: the 20 Hz loop calls ``set_level`` every
-  50 ms, but Lovense quantizes strength to 0..20. Identical integer steps within
-  the 0.85 s keepalive window are skipped, and if phone Wi-Fi stalls briefly,
-  intermediate steps coalesce so only the freshest level is sent next.
-- Multi-motor support: defaults to ``All:<0-20>`` and ``Stop`` (apiVer 1) so
-  Lush, Hush, Domi, Nora, Max, Edge, Solace, Tenera, and Ferri all respond.
-- Strict API envelope check: validates Lovense's ``code == 200`` field instead
-  of treating any HTTP 200 error payload as connected.
+Smoothness & reliability architecture:
+- Buffered ``Pattern`` timelines (``command: "Pattern"``, ``rule: "V:1;F:;S:120#"``,
+  up to 50 ``0..20`` steps per request, ``apiVer: 2``): instead of spamming discrete
+  ``Function`` HTTP calls every 50 ms (which floods phone Wi-Fi and Lovense's BLE
+  command queue), ``DeviceManager`` hands Lovense multi-second lookahead curves
+  that Lovense clocks locally on its own 120 ms BLE timer.
+- Anti-wraparound ``timeSec`` sizing: buffer length always exceeds ``timeSec``
+  (e.g. 45 steps × 120 ms = 5.4 s with ``timeSec: 5``, refreshed every ~3.5 s,
+  and padded with trailing zeros on decay/preview tails) so Lovense never loops
+  back to step 0 at the end of a fade-out.
+- Automatic fallback to ``Function`` if an older bridge rejects ``Pattern``.
 """
 from __future__ import annotations
 
-import asyncio
 import json
+import math
 import time
 from urllib.parse import urlparse
 
@@ -30,15 +32,16 @@ CANDIDATE_PORTS: tuple[tuple[bool, int], ...] = (
     (True, 34568),
 )
 KEEPALIVE_RESEND_S = 0.85
+MAX_PATTERN_STEPS = 50
 
 
 def _percent_to_lovense(frac: float) -> int:
-    """Map 0.0..1.0 -> 0..20, never rounding a nonzero level down to 0."""
+    """Map 0.0..1.0 -> 0..20, never rounding a positive audible level down to 0."""
     frac = min(max(float(frac), 0.0), 1.0)
+    if frac <= 0.004:
+        return 0
     v = round(frac * 20)
-    if frac > 0.0 and v == 0:
-        v = 1
-    return v
+    return 1 if v == 0 else v
 
 
 def normalize_endpoint(raw_host: str, default_port: int = 20010, default_https: bool = False) -> tuple[bool, str, int]:
@@ -54,7 +57,6 @@ def normalize_endpoint(raw_host: str, default_port: int = 20010, default_https: 
         port = parsed.port or (30010 if https else int(default_port or 20010))
         return https, host, int(port)
 
-    # Strip accidental trailing paths like "192.168.1.5:20010/command"
     text = text.split("/", 1)[0].strip()
     if ":" in text and text.count(":") == 1:
         host_part, port_part = text.rsplit(":", 1)
@@ -87,15 +89,20 @@ class LovenseClient:
         self.toys: list[dict] = []
         self.last_error: str = ""
         self.resolved_url: str = ""
+        self.last_rtt_s: float = 0.025
 
-        # Step deduplication & Wi-Fi backpressure coalescing
+        self._pattern_unsupported: bool = False
         self._last_step: int = 0
         self._last_send_at: float = 0.0
         self._sending: bool = False
-        self._pending_frac: float | None = None
+        self._pending_op: tuple | None = None
 
     def _cfg(self) -> dict:
         return self._get_config() or {}
+
+    @property
+    def supports_pattern_stream(self) -> bool:
+        return (not self._pattern_unsupported) and bool(self._cfg().get("use_pattern_api", True))
 
     @property
     def enabled(self) -> bool:
@@ -122,7 +129,7 @@ class LovenseClient:
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            kwargs: dict = {"timeout": 1.2}
+            kwargs: dict = {"timeout": 1.5}
             if self._transport is not None:
                 kwargs["transport"] = self._transport
             else:
@@ -132,9 +139,12 @@ class LovenseClient:
         return self._client
 
     async def _post_url(self, url: str, body: dict) -> dict | None:
+        t0 = self._clock()
         try:
             resp = await self._http().post(url, json=body)
             resp.raise_for_status()
+            elapsed = max(0.0, self._clock() - t0)
+            self.last_rtt_s = 0.7 * self.last_rtt_s + 0.3 * min(0.5, elapsed)
             data = resp.json()
             if isinstance(data, dict) and "code" in data:
                 try:
@@ -159,11 +169,7 @@ class LovenseClient:
         return await self._post_url(self._url(), body)
 
     async def probe(self, auto_discover: bool = True) -> dict | None:
-        """Query GetToys; if configured port fails, try standard Lovense ports.
-
-        Returns ``{"host": ..., "port": ..., "https": ...}`` on success so the
-        caller can persist auto-discovered settings, or ``None`` on failure.
-        """
+        """Query GetToys; if configured port fails, try standard Lovense ports."""
         cfg = self._cfg()
         if not cfg.get("enabled", True):
             self.connected = False
@@ -179,7 +185,6 @@ class LovenseClient:
                     if cand not in candidates:
                         candidates.append(cand)
         elif auto_discover:
-            # Blank host: try local Lovense Connect on 127.0.0.1
             for cand_https, cand_port in CANDIDATE_PORTS:
                 candidates.append((cand_https, "127.0.0.1", cand_port))
 
@@ -194,6 +199,7 @@ class LovenseClient:
             data = await self._post_url(url, {"command": "GetToys"})
             if data is not None:
                 self.toys = self._parse_toys(data)
+                self._pattern_unsupported = False
                 return {"host": cand_host, "port": cand_port, "https": cand_https}
             if not first_err:
                 first_err = self.last_error
@@ -227,7 +233,6 @@ class LovenseClient:
                     raw_list.append(dict(item))
         normalized = []
         for t in raw_list:
-            # Filter out non-toy metadata keys if data had no "toys" wrapper
             if not any(k in t for k in ("id", "name", "nickName", "battery", "status")):
                 continue
             name = t.get("nickName") or t.get("name") or t.get("id") or "Lovense Toy"
@@ -241,53 +246,146 @@ class LovenseClient:
         mode = str(self._cfg().get("action_mode", "All") or "All").strip()
         return "Vibrate" if mode.lower() == "vibrate" else "All"
 
+    def _pattern_features(self) -> str:
+        return "v" if self._action_prefix() == "Vibrate" else ""
+
+    async def send_pattern(
+        self,
+        levels: list[float],
+        *,
+        interval_ms: int = 120,
+        active_seconds: float | None = None,
+    ) -> None:
+        """Send a multi-step 0..20 ``Pattern`` timeline to Lovense.
+
+         Lovense executes the steps natively on its local timer at ``interval_ms``
+        spacing (>= 100 ms), completely eliminating per-tick Wi-Fi/BLE jitter.
+        """
+        if not self.enabled:
+            return
+        if not self.supports_pattern_stream:
+            if levels:
+                await self.set_level(levels[0])
+            return
+
+        interval_ms = max(100, int(interval_ms))
+        steps = [_percent_to_lovense(x) for x in levels[:MAX_PATTERN_STEPS]]
+        if not steps or all(s == 0 for s in steps):
+            await self.stop()
+            return
+
+        # Compute timeSec strictly <= total buffer span so Lovense never wraps
+        # back to steps[0] at the end of a decaying tail or finite preview.
+        step_s = interval_ms / 1000.0
+        last_nonzero_idx = max(i for i, s in enumerate(steps) if s > 0)
+        nonzero_span_s = (last_nonzero_idx + 1) * step_s
+        if active_seconds is not None:
+            desired_s = min(float(active_seconds), len(steps) * step_s)
+        else:
+            desired_s = min(nonzero_span_s, len(steps) * step_s - 0.15)
+        time_sec = max(1, int(math.ceil(max(0.8, desired_s))))
+
+        # Ensure len(steps) * step_s >= time_sec + 0.12 (pad with 0 if finite tail,
+        # or repeat final value if continuous) so wrap-around to steps[0] is impossible.
+        min_steps = min(MAX_PATTERN_STEPS, int(math.ceil((time_sec + 0.15) / step_s)))
+        if len(steps) < min_steps:
+            pad_val = 0 if steps[-1] == 0 else steps[-1]
+            steps.extend([pad_val] * (min_steps - len(steps)))
+
+        payload = {
+            "command": "Pattern",
+            "rule": f"V:1;F:{self._pattern_features()};S:{interval_ms}#",
+            "strength": ";".join(str(s) for s in steps),
+            "timeSec": time_sec,
+            "apiVer": 2,
+        }
+        await self._enqueue_or_send(("pattern", payload, steps[0], levels[0]))
+
     async def set_level(self, frac: float) -> None:
         if not self.enabled:
             return
         step = _percent_to_lovense(frac)
+        if step == 0:
+            if self._last_step > 0:
+                await self.stop()
+            return
         now = self._clock()
         if step == self._last_step and (now - self._last_send_at) < KEEPALIVE_RESEND_S and self.connected:
             return
-
-        if self._sending:
-            # Coalesce while a LAN request is in flight so packets never backlog
-            self._pending_frac = frac
-            return
-
-        self._sending = True
-        try:
-            current_frac: float | None = frac
-            while current_frac is not None:
-                self._pending_frac = None
-                s = _percent_to_lovense(current_frac)
-                cfg = self._cfg()
-                use_safety = cfg.get("use_time_sec_safety", True)
-                prefix = self._action_prefix()
-                ok = await self._post({
-                    "command": "Function",
-                    "action": f"{prefix}:{s}",
-                    "timeSec": 2 if use_safety else 0,
-                    "apiVer": 1,
-                })
-                if ok is not None:
-                    self._last_step = s
-                    self._last_send_at = self._clock()
-                current_frac = self._pending_frac
-        finally:
-            self._sending = False
+        cfg = self._cfg()
+        use_safety = cfg.get("use_time_sec_safety", True)
+        prefix = self._action_prefix()
+        payload = {
+            "command": "Function",
+            "action": f"{prefix}:{step}",
+            "timeSec": 2 if use_safety else 0,
+            "apiVer": 1,
+        }
+        await self._enqueue_or_send(("function", payload, step))
 
     async def stop(self) -> None:
-        self._pending_frac = None
+        self._pending_op = None
         self._last_step = 0
         self._last_send_at = 0.0
         if not self.enabled:
             return
-        await self._post({
+        payload = {
             "command": "Function",
             "action": "Stop",
             "timeSec": 0,
             "apiVer": 1,
-        })
+        }
+        if self._sending:
+            # Preempt any queued pattern so Stop always wins as soon as in-flight finishes
+            self._pending_op = ("stop", payload)
+            return
+        await self._enqueue_or_send(("stop", payload))
+
+    async def _enqueue_or_send(self, op: tuple) -> None:
+        if self._sending:
+            self._pending_op = op
+            return
+
+        self._sending = True
+        try:
+            cur: tuple | None = op
+            while cur is not None:
+                self._pending_op = None
+                kind = cur[0]
+                if kind == "stop":
+                    await self._post(cur[1])
+                    self._last_step = 0
+                    self._last_send_at = 0.0
+                elif kind == "function":
+                    _, payload, step = cur
+                    ok = await self._post(payload)
+                    if ok is not None:
+                        self._last_step = step
+                        self._last_send_at = self._clock()
+                elif kind == "pattern":
+                    _, payload, first_step, first_frac = cur
+                    was_connected = self.connected
+                    ok = await self._post(payload)
+                    if ok is not None:
+                        self._last_step = first_step
+                        self._last_send_at = self._clock()
+                    elif was_connected and self.last_error.startswith("Lovense error:"):
+                        # Bridge connected via GetToys but rejected Pattern -> fallback
+                        self._pattern_unsupported = True
+                        prefix = self._action_prefix()
+                        s = _percent_to_lovense(first_frac)
+                        fb = await self._post({
+                            "command": "Function",
+                            "action": f"{prefix}:{s}" if s > 0 else "Stop",
+                            "timeSec": 2 if s > 0 else 0,
+                            "apiVer": 1,
+                        })
+                        if fb is not None:
+                            self._last_step = s
+                            self._last_send_at = self._clock()
+                cur = self._pending_op
+        finally:
+            self._sending = False
 
     def status(self) -> dict:
         https, host, port = self._endpoint()
@@ -298,12 +396,14 @@ class LovenseClient:
             "port": port,
             "https": https,
             "connected": self.connected,
+            "mode": "pattern" if self.supports_pattern_stream else "function",
+            "rtt_ms": round(self.last_rtt_s * 1000.0, 1),
             "devices": list(self.toys),
             "last_error": self.last_error,
         }
 
     async def aclose(self) -> None:
-        self._pending_frac = None
+        self._pending_op = None
         self._last_step = 0
         if self._client is not None:
             await self._client.aclose()
