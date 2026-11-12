@@ -1,12 +1,12 @@
 {
   "id": "wb_toy_link",
   "name": "Toy Link",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "icon": "🔗",
-  "description": "Haptics integration: drives Lovense and buttplug.io/Intiface devices from the story in real time. Keyword and semantic triggers with per-category strength and patterns; configure devices, triggers, and models in the Toy Studio main-menu entry.",
+  "description": "Lovense haptics steered in real time by JEV with a procedural anti-numbing pattern engine. Configure your Lovense connection, feel presets, and dynamic patterns in Toy Studio.",
   "dependencies": [],
   "consumes": {
-    "state": ["turn"],
+    "state": ["turn", "history", "input_text"],
     "module_data": [],
     "module_configs": [],
     "world_data": false
@@ -21,7 +21,7 @@
     "/toys": "on_command_toys"
   },
   "command_help": {
-    "/toys": "Control toys: stop | on | off | test [0-100] | status"
+    "/toys": "Control Lovense: stop | on | off | test [0-100] [pattern] | pattern <name|auto> | status"
   },
   "settings_schema": {
     "enabled": {
@@ -39,7 +39,7 @@
     {
       "id": "toy-studio",
       "label": "Toy Studio",
-      "description": "Devices, triggers, and haptics settings",
+      "description": "Lovense setup, JEV steering, and dynamic pattern gallery",
       "icon": "🎛️",
       "screen": "ui/ToyStudio.jsx"
     }

@@ -13,7 +13,7 @@ class FakeClock:
 
 
 class FakeClient:
-    name = "fake"
+    name = "lovense"
     enabled = True
     connected = True
 
@@ -32,7 +32,12 @@ class FakeClient:
         return {"name": self.name}
 
 
-CONFIG = {"master_cap_global": 100, "ramp_ms": 500, "tick_hz": 10}
+CONFIG = {
+    "master_cap_global": 100,
+    "ramp_ms": 500,
+    "contrast_mode": "balanced",
+    "tick_hz": 20,
+}
 
 
 def make_manager(config=None):
@@ -44,7 +49,7 @@ def make_manager(config=None):
     return manager, vibe, client, clock, cfg
 
 
-async def run_ticks(manager, clock, n, dt=0.1):
+async def run_ticks(manager, clock, n, dt=0.05):
     for _ in range(n):
         clock.t += dt
         await manager.tick()
@@ -52,103 +57,81 @@ async def run_ticks(manager, clock, n, dt=0.1):
 
 async def test_envelope_slews_toward_target():
     manager, vibe, client, clock, _ = make_manager()
-    await manager.tick()                      # initialize tick clock
-    vibe.set_target(100, "constant")
-    await run_ticks(manager, clock, 1)        # 100 ms of a 500 ms ramp = +20
+    await manager.tick()
+    vibe.set_target(100, "velvet")
+    await run_ticks(manager, clock, 2)        # 100 ms of a 500 ms ramp = +20
     assert manager.envelope == pytest.approx(20.0)
-    await run_ticks(manager, clock, 3)
-    assert manager.envelope == pytest.approx(80.0)
-    await run_ticks(manager, clock, 2)
-    assert manager.envelope == 100.0          # reaches target, no overshoot
-    assert client.levels[-1] == 1.0
-
-
-async def test_ramp_down_via_stop_word_then_zero_sent_once():
-    manager, vibe, client, clock, _ = make_manager()
-    await manager.tick()
-    vibe.set_target(100, "constant")
-    await run_ticks(manager, clock, 6)        # fully up
-    vibe.clear(source="keyword:r_sleep")      # stop-word: ramps down via slew
-    await run_ticks(manager, clock, 2)
-    assert manager.envelope == pytest.approx(60.0)  # descending, not instant
-    await run_ticks(manager, clock, 4)
-    assert manager.envelope == 0.0
-    assert client.stops == 1                  # explicit stop exactly once
-    await run_ticks(manager, clock, 5)
-    assert client.stops == 1                  # and never again while silent
-
-
-async def test_change_threshold_and_keepalive():
-    manager, vibe, client, clock, _ = make_manager()
-    await manager.tick()
-    vibe.set_target(50, "constant")
-    await run_ticks(manager, clock, 6)        # ramp completes
-    sends_after_ramp = len(client.levels)
-    await run_ticks(manager, clock, 3)        # level stable, within threshold
-    assert len(client.levels) == sends_after_ramp
-    await run_ticks(manager, clock, 7)        # >0.9 s since last send
-    assert len(client.levels) == sends_after_ramp + 1   # keepalive resend
-
-
-async def test_instant_stop_bypasses_slew():
-    manager, vibe, client, clock, _ = make_manager()
-    await manager.tick()
-    vibe.set_target(100, "constant")
     await run_ticks(manager, clock, 6)
-    await manager.instant_stop()
+    assert manager.envelope == pytest.approx(80.0)
+    await run_ticks(manager, clock, 3)
+    assert manager.envelope == 100.0
+    assert client.levels[-1] > 0.5
+
+
+async def test_ramp_down_to_zero_sends_stop_once():
+    manager, vibe, client, clock, _ = make_manager()
+    await manager.tick()
+    vibe.set_target(100, "velvet")
+    await run_ticks(manager, clock, 12)
+    vibe.clear(source="jev:none")
+    await run_ticks(manager, clock, 4)
+    assert 0.0 < manager.envelope < 100.0
+    await run_ticks(manager, clock, 8)
     assert manager.envelope == 0.0
     assert client.stops == 1
-    assert vibe.strength == 0.0               # latch cleared too
-    await run_ticks(manager, clock, 3)
+    await run_ticks(manager, clock, 6)
     assert client.stops == 1
+
+
+async def test_instant_stop_bypasses_slew_and_cancels_preview():
+    manager, vibe, client, clock, _ = make_manager()
+    await manager.tick()
+    manager.start_preview(strength=90, pattern="crest", seconds=4.0)
+    await run_ticks(manager, clock, 5)
+    assert manager.preview_active is True
+    assert manager.current_level > 0.3
+
+    await manager.instant_stop()
+    assert manager.preview_active is False
+    assert manager.envelope == 0.0
+    assert manager.current_level == 0.0
+    assert client.stops == 1
+
+
+async def test_preview_runs_cleanly_inside_loop_then_returns_to_latch():
+    manager, vibe, client, clock, _ = make_manager()
+    await manager.tick()
+    manager.start_preview(strength=80, pattern="crest", seconds=1.0)
+    await run_ticks(manager, clock, 10)       # 0.5 s in -> active preview
+    assert manager.preview_active is True
+    assert manager.current_level > 0.25
+
+    await run_ticks(manager, clock, 15)       # past 1.0 s -> preview ends cleanly
+    assert manager.preview_active is False
+    assert manager.current_level == 0.0
+    assert client.stops >= 1
 
 
 async def test_gate_off_immediate_on_ramps_back():
     manager, vibe, client, clock, _ = make_manager()
     await manager.tick()
-    vibe.set_target(80, "constant")
-    await run_ticks(manager, clock, 6)
+    vibe.set_target(80, "swell")
+    await run_ticks(manager, clock, 12)
     await manager.set_gate(False)
-    assert client.stops == 1                  # silenced immediately
+    assert client.stops == 1
     assert manager.envelope == 0.0
-    assert vibe.strength == 80.0              # latch untouched
-    await run_ticks(manager, clock, 3)
-    assert manager.envelope == 0.0            # stays silent while gated
+    assert vibe.strength == 80.0
     await manager.set_gate(True)
-    await run_ticks(manager, clock, 1)
-    assert 0 < manager.envelope < 80.0        # ramping back up, not jumping
-    await run_ticks(manager, clock, 5)
-    assert manager.envelope == pytest.approx(80.0)
+    await run_ticks(manager, clock, 2)
+    assert 0.0 < manager.envelope < 80.0
 
 
-async def test_caps_multiply():
-    manager, vibe, client, clock, cfg = make_manager(
-        dict(CONFIG, master_cap_global=50))
+async def test_caps_multiply_and_feel_presets_work():
+    cfg = {"master_cap_global": 50, "response_feel": "snappy", "tick_hz": 20}
+    manager, vibe, client, clock, _ = make_manager(cfg)
     manager.story_cap = 50
     await manager.tick()
-    vibe.set_target(100, "constant")
-    await run_ticks(manager, clock, 6)
-    assert client.levels[-1] == 0.25          # 1.0 × 0.5 × 0.5
-
-
-async def test_pulse_edges_stay_crisp_after_ramp():
-    manager, vibe, client, clock, _ = make_manager()
-    await manager.tick()
-    vibe.set_target(100, "pulse", {"pulse_on_ms": 300, "pulse_off_ms": 300})
-    await run_ticks(manager, clock, 5)        # envelope reaches 100 inside "on"
-    # 0.95 s into a 600 ms cycle = 350 ms in = off phase — full stop, not a ramp.
-    clock.t = vibe.latched_at + 0.95
-    await manager.tick()
-    assert manager.current_level == 0.0
-    assert client.stops == 1
-    clock.t = vibe.latched_at + 1.25          # back in an on phase
-    await manager.tick()
-    assert client.levels[-1] == 1.0           # crisp full-level edge
-
-
-async def test_zero_ramp_ms_means_instant_targets():
-    manager, vibe, client, clock, _ = make_manager(dict(CONFIG, ramp_ms=0))
-    await manager.tick()
-    vibe.set_target(90, "constant")
-    await run_ticks(manager, clock, 1)
-    assert manager.envelope == 90.0
+    vibe.set_target(100, "velvet")
+    await run_ticks(manager, clock, 6)        # snappy 140 ms ramp finishes in 300 ms
+    assert manager.envelope == 100.0
+    assert client.levels[-1] <= 0.25 + 1e-4

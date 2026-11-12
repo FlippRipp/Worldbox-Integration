@@ -1,132 +1,175 @@
-"""Toy Link — drives haptics devices (Lovense / buttplug.io) from the story.
+"""Toy Link — JEV-steered Lovense haptics module for WorldboxAI.
 
-Thin glue: the real logic lives in the ``toylink`` package. This file wires
-WorldboxAI's module hooks to the trigger engines and the device loop:
+Wires WorldboxAI's streaming & turn-lifecycle module hooks to ``JevDirector``,
+the procedural pattern engine, and ``LovenseClient``:
 
-    on_stream_token  → KeywordScanner + SemanticEngine feed → VibeState
-    on_turn_stopped  → flush; cancelled/error turns hard-stop the devices
-    /toys command + REST router + Toy Studio → manual control and settings
-
-Requires a WorldboxAI build with the stream/turn-lifecycle module API
-(``MODULE_API_FEATURES`` ⊇ {stream_tokens, turn_lifecycle}). Without it the
-module loads but stays inert and says so in ``/status`` — no monkey-patching.
+    on_turn_start    → sync story config, detect save switches, arm JevDirector
+    on_stream_token  → feed tokens into JevDirector → VibeState
+    on_turn_stopped  → final JEV flush; cancelled/error turns hard-stop devices
+    /toys + REST API → Toy Studio, in-story controls, live pattern previews
 """
+from __future__ import annotations
+
 import asyncio
 import sys
 from pathlib import Path
 
-# Loaded as a loose spec module by the registry, so make the sibling package
-# importable no matter the working directory.
 _MODULE_DIR = str(Path(__file__).resolve().parent)
 if _MODULE_DIR not in sys.path:
     sys.path.insert(0, _MODULE_DIR)
 
-from toylink.buttplug_client import ButtplugClient
 from toylink.config_store import ConfigStore
 from toylink.device_manager import DeviceManager
-from toylink.keyword_engine import KeywordScanner
-from toylink.lovense_client import LovenseClient
-from toylink.patterns import VibeState
-from toylink.semantic_engine import SemanticEngine
+from toylink.jev_director import JevDirector
+from toylink.lovense_client import LovenseClient, normalize_endpoint
+from toylink.patterns import (
+    CONTRAST_MODES,
+    PATTERNS,
+    PATTERN_SPECS,
+    VibeState,
+    normalize_pattern,
+    sample_pattern_curve,
+)
 
 MODULE_ID = "wb_toy_link"
 REQUIRED_FEATURES = {"stream_tokens", "turn_lifecycle"}
 
 _services: dict = {}
-_sdk = None                    # captured from hook calls; used for sdk.llm
+_sdk = None
 _hooks_available = False
 _story_enabled = True
+_active_save_id: str | None = None
 _store: ConfigStore | None = None
 _vibe: VibeState | None = None
-_scanner: KeywordScanner | None = None
-_semantic: SemanticEngine | None = None
+_director: JevDirector | None = None
 _manager: DeviceManager | None = None
 _lovense: LovenseClient | None = None
-_buttplug: ButtplugClient | None = None
 _bg_tasks: set = set()
 
 
 def set_services(services: dict) -> None:
-    global _services, _sdk, _hooks_available, _store, _vibe, _scanner
-    global _semantic, _manager, _lovense, _buttplug
+    global _services, _sdk, _hooks_available, _story_enabled, _active_save_id
+    global _store, _vibe, _director, _manager, _lovense
     _services = services or {}
     _sdk = None
+    _story_enabled = True
+    _active_save_id = None
+
     engine = _services.get("engine")
     features = set(getattr(engine, "MODULE_API_FEATURES", set()) or set())
     _hooks_available = REQUIRED_FEATURES <= features
 
-    base = _services.get("global_data_dir") or _services.get("data_dir") \
-        or Path(_MODULE_DIR) / "data"
+    base = _services.get("global_data_dir") or _services.get("data_dir") or Path(_MODULE_DIR) / "data"
     _store = ConfigStore(Path(base) / MODULE_ID)
     _vibe = VibeState()
     _lovense = LovenseClient(lambda: _store.config().get("lovense", {}))
-    _buttplug = ButtplugClient(lambda: _store.config().get("buttplug", {}))
-    _manager = DeviceManager(_vibe, [_lovense, _buttplug], _store.config)
-    _scanner = KeywordScanner(_store.ruleset)
-    _semantic = SemanticEngine(_classify_call, _store.ruleset, _store.config,
-                               _apply_semantic_effect)
+    _manager = DeviceManager(_vibe, [_lovense], _store.config)
+    _director = JevDirector(
+        _decide_call,
+        _store.config,
+        _apply_jev_verdict,
+        lambda: _vibe.strength,
+    )
+
+    # If a Lovense host is already saved, probe in the background on startup
+    try:
+        loop = asyncio.get_running_loop()
+        if _lovense.enabled:
+            _spawn(_startup_probe())
+            _manager.ensure_running()
+    except RuntimeError:
+        pass
+
+
+async def _startup_probe() -> None:
+    if _lovense is None or _store is None:
+        return
+    found = await _lovense.probe(auto_discover=True)
+    if found:
+        _store.save_config({"lovense": found})
 
 
 async def shutdown() -> None:
-    """Test/teardown helper: stop the loop and drop connections."""
+    """Stop the loop, cancel in-flight JEV tasks, and close HTTP clients."""
+    if _director is not None:
+        _director.invalidate()
     if _manager is not None and _manager._task is not None:
         _manager._task.cancel()
         _manager._task = None
-    if _buttplug is not None:
-        await _buttplug.disconnect()
     if _lovense is not None:
         await _lovense.aclose()
 
 
-# ----------------------------------------------------------------- LLM access
+# ------------------------------------------------------------------ JEV bridge
 
-async def _classify_call(prompt: str) -> str:
-    """Semantic classifier call: the user's per-module model override goes
-    straight to engine.llm; otherwise the sdk bridge's "fastest" slot
-    (module_fast_model) — provider-agnostic, inherits keys and retries.
-    The sdk comes from the hooks when a turn has run, or from engine.sdk
-    (graph.py owns one) so Toy Studio's tester works before any turn; as a
-    last resort call engine.llm with the fast model directly."""
-    override = (_store.config().get("semantic", {}) or {}).get("model_override", "")
+def _jev_service():
     engine = _services.get("engine")
-    inspector_ctx = {"call_type": "module_fast",
-                     "step": "module:toy_link_semantic",
-                     "module_source": MODULE_ID}
-    if override and engine is not None:
-        return await engine.llm.simple_completion(
-            messages=[{"role": "user", "content": prompt}],
-            model=override, temperature=0, inspector_ctx=inspector_ctx)
+    llm = getattr(engine, "llm", None)
+    return getattr(llm, "decisions", None)
+
+
+def _jev_host_status() -> dict:
+    svc = _jev_service()
+    if svc is None:
+        return {"available": False, "enabled": False, "has_credentials": False, "ready": False, "model": ""}
+    pub = svc.public_config() if hasattr(svc, "public_config") else {}
+    enabled = bool(pub.get("enabled", False))
+    has_creds = bool(svc.has_credentials()) if hasattr(svc, "has_credentials") else bool(pub.get("api_key_set"))
+    return {
+        "available": True,
+        "enabled": enabled,
+        "has_credentials": has_creds,
+        "ready": enabled and has_creds,
+        "model": pub.get("model", "jev-latest"),
+    }
+
+
+async def _decide_call(state_payload: dict, questions: dict, step: str):
+    """Route typed decisions through sdk.llm.decide (or engine.llm.decisions pre-turn)."""
+    engine = _services.get("engine")
     sdk = _sdk or getattr(engine, "sdk", None)
-    if sdk is not None:
-        return await sdk.llm.generate(prompt, model_preference="fastest")
-    if engine is not None:
-        model = _app_default_model() or None
-        return await engine.llm.simple_completion(
-            messages=[{"role": "user", "content": prompt}],
-            model=model, temperature=0, inspector_ctx=inspector_ctx)
-    raise RuntimeError("no LLM access: engine service unavailable")
+    if sdk is not None and hasattr(getattr(sdk, "llm", None), "decide"):
+        return await sdk.llm.decide(state_payload, questions, module=MODULE_ID, step=step)
+
+    svc = _jev_service()
+    if svc is not None:
+        llm = getattr(engine, "llm", None)
+        mode = getattr(llm, "mode", "live")
+        inspector = getattr(llm, "inspector", None)
+        return await svc.decide(
+            state_payload,
+            questions,
+            module=MODULE_ID,
+            step=step,
+            mode=mode,
+            inspector=inspector,
+        )
+
+    class _UnavailableDecision:
+        answers = {}
+        reason = "JEV service unavailable on host"
+        finished = True
+
+        async def finish(self, *_args, **_kwargs):
+            pass
+
+    return _UnavailableDecision()
 
 
-def _app_default_model() -> str:
-    engine = _services.get("engine")
-    return str(getattr(getattr(engine, "llm", None), "module_fast_model", "") or "")
+def _apply_jev_verdict(verdict: dict) -> None:
+    if not _story_enabled:
+        return
+    pat = verdict.get("pattern") or "velvet"
+    _vibe.set_target(
+        verdict.get("strength", 0.0),
+        pat,
+        source=f"jev:{pat}",
+        pace=verdict.get("pace", 0.45),
+    )
+    _manager.ensure_running()
 
 
-# ------------------------------------------------------------------- triggers
-
-def _mode() -> str:
-    return _store.config().get("trigger_mode", "hybrid")
-
-
-def _apply_semantic_effect(effect: dict) -> None:
-    label = effect.get("category") or "semantic"
-    _vibe.apply_effect({**effect, "rule_id": label}, source_prefix="semantic:")
-
-
-def _apply_keyword_effects(effects: list) -> None:
-    for eff in effects:
-        _vibe.apply_effect(eff, source_prefix="keyword:")
-
+# ----------------------------------------------------------------- story hooks
 
 def _story_config(state: dict) -> dict:
     configs = (state or {}).get("module_configs") or {}
@@ -134,86 +177,134 @@ def _story_config(state: dict) -> dict:
     return own if isinstance(own, dict) else {}
 
 
-# ---------------------------------------------------------------------- hooks
+async def _apply_story_config(enabled: bool, master_cap: float, save_id: str | None = None) -> None:
+    global _story_enabled, _active_save_id
+    if save_id is not None and _active_save_id is not None and save_id != _active_save_id:
+        # Switching stories clears the old story's latch so nothing bleeds across saves
+        _director.invalidate()
+        await _manager.instant_stop()
+    if save_id is not None:
+        _active_save_id = save_id
+
+    _story_enabled = bool(enabled)
+    _manager.story_cap = max(0.0, min(100.0, float(master_cap)))
+    if not _story_enabled:
+        _director.invalidate()
+        if _vibe.strength > 0 or _manager.current_level > 0 or _manager.preview_active:
+            await _manager.instant_stop()
+
 
 async def on_turn_start(state: dict, sdk) -> None:
-    global _sdk, _story_enabled
+    global _sdk
     _sdk = sdk
     cfg = _story_config(state)
-    _story_enabled = bool(cfg.get("enabled", True))
-    _manager.story_cap = float(cfg.get("master_cap", 70))
+    await _apply_story_config(
+        enabled=bool(cfg.get("enabled", True)),
+        master_cap=float(cfg.get("master_cap", 70)),
+        save_id=(state or {}).get("active_save_id"),
+    )
     if not _story_enabled:
-        # Disable must mean silence — never leave a latched level running.
-        if _vibe.strength > 0 or _manager.current_level > 0:
-            await _manager.instant_stop()
         return
-    _scanner.reset()
+    _director.start_turn(state)
     _manager.ensure_running()
-    if _buttplug.enabled:
-        _buttplug.start()
 
 
 def on_stream_token(token: str, state: dict, sdk) -> None:
-    # Sync and O(token): scanner/semantic buffering only; LLM calls and device
-    # writes happen on their own tasks.
+    global _sdk
+    if sdk is not None:
+        _sdk = sdk
     if not _story_enabled or not _hooks_available:
         return
-    mode = _mode()
-    if mode in ("hybrid", "keywords"):
-        effects = _scanner.feed(token)
-        if effects:
-            _apply_keyword_effects(effects)
-    if mode in ("hybrid", "semantic"):
-        _semantic.feed(token)
+    _director.feed_token(token)
 
 
 async def on_turn_stopped(state: dict, sdk, reason: str) -> None:
+    global _sdk
+    if sdk is not None:
+        _sdk = sdk
     if not _story_enabled:
         return
-    mode = _mode()
-    if mode in ("hybrid", "keywords"):
-        _apply_keyword_effects(_scanner.end_of_turn())
     if reason in ("cancelled", "error"):
-        # The kill switch: a stopped or crashed turn must not keep buzzing.
+        _director.invalidate()
         await _manager.instant_stop()
         return
-    if mode in ("hybrid", "semantic"):
-        _semantic.end_of_turn()
     if _store.config().get("stop_on_turn_end"):
+        _director.invalidate()
         await _manager.instant_stop()
+        return
+    _director.finish_turn()
 
 
 # -------------------------------------------------------------------- command
 
 async def on_command_toys(args: list, state: dict, sdk) -> dict:
-    sub = (args[0].lower() if args else "status")
+    sub = args[0].lower() if args else "status"
     if sub == "stop":
+        _director.invalidate()
         await _manager.instant_stop()
         return {"message": "⏹ All toys stopped and cleared."}
     if sub in ("on", "off"):
         await _manager.set_gate(sub == "on")
-        return {"message": "▶ Vibration enabled — returning to the story's level."
-                if sub == "on" else "⏸ Vibration off (the story keeps tracking)."}
+        return {
+            "message": "▶ Vibration enabled — returning to the story's level."
+            if sub == "on"
+            else "⏸ Vibration muted (JEV keeps tracking in the background)."
+        }
     if sub == "test":
         try:
-            strength = float(args[1]) if len(args) > 1 else 50.0
+            strength = float(args[1]) if len(args) > 1 else 55.0
         except ValueError:
-            return {"message": "Usage: /toys test [0-100]", "error": True}
-        _spawn(_manager.test_buzz(strength))
-        return {"message": f"Test buzz at {int(strength)}%."}
+            return {"message": "Usage: /toys test [0-100] [pattern]", "error": True}
+        pat = normalize_pattern(args[2]) if len(args) > 2 else "crest"
+        _manager.ensure_running()
+        _manager.start_preview(strength=strength, pattern=pat, seconds=2.5)
+        return {"message": f"⚡ Testing {PATTERN_SPECS[pat]['label']} at {int(strength)}%."}
+    if sub == "pattern":
+        if len(args) < 2:
+            return {
+                "message": f"Available patterns: auto, {', '.join(PATTERNS)}",
+                "error": True,
+            }
+        choice_name = args[1].lower()
+        if choice_name in ("auto", "jev", "none"):
+            _director.pattern_override = None
+            return {"message": "🎛️ Pattern selection returned to Auto (JEV)."}
+        if choice_name not in PATTERN_SPECS:
+            return {
+                "message": f"Unknown pattern {choice_name!r}. Choose: auto, {', '.join(PATTERNS)}",
+                "error": True,
+            }
+        _director.pattern_override = choice_name
+        if len(args) > 2:
+            try:
+                s = float(args[2])
+                _vibe.set_target(s, choice_name, source=f"command:{choice_name}")
+                _manager.ensure_running()
+            except ValueError:
+                pass
+        elif _vibe.strength > 0:
+            _vibe.set_target(_vibe.strength, choice_name, source=f"command:{choice_name}")
+        return {"message": f"🎛️ Locked pattern to {PATTERN_SPECS[choice_name]['label']}."}
     if sub == "status":
         s = _status()
-        backends = ", ".join(
-            f"{b['name']}: {'connected' if b['connected'] else ('off' if not b['enabled'] else 'not connected')}"
-            for b in s["backends"])
-        return {"message": (
-            f"Toys — level {int(s['level'] * 100)}%, "
-            f"{'on' if s['vibe_on'] else 'muted'}, mode {s['trigger_mode']}; "
-            f"{backends or 'no backends'}."
-            + ("" if s["hooks_available"] else
-               " ⚠ WorldboxAI build lacks stream hooks — triggers inactive."))}
-    return {"message": "Usage: /toys stop | on | off | test [0-100] | status",
-            "error": True}
+        lov = s["lovense"]
+        lov_txt = (
+            f"connected ({len(lov['devices'])} toy{'s' if len(lov['devices']) != 1 else ''})"
+            if lov["connected"]
+            else ("not configured" if not lov["configured_host"] else "not connected")
+        )
+        jev_txt = "ready" if s["jev"]["ready"] else ("disabled" if not s["jev"]["enabled"] else "needs API key")
+        return {
+            "message": (
+                f"Toys — {int(s['level'] * 100)}% ({s['vibe']['pattern_label']}), "
+                f"{'on' if s['vibe_on'] else 'muted'}, Lovense {lov_txt}, JEV {jev_txt}."
+                + ("" if s["hooks_available"] else " ⚠ WorldboxAI build lacks stream hooks.")
+            )
+        }
+    return {
+        "message": "Usage: /toys stop | on | off | test [0-100] [pattern] | pattern <name|auto> | status",
+        "error": True,
+    }
 
 
 def _spawn(coro) -> None:
@@ -226,22 +317,42 @@ def _spawn(coro) -> None:
 
 def _status() -> dict:
     m = _manager.status()
-    semantic = _semantic.status()
-    semantic["model_override"] = (_store.config().get("semantic", {}) or {}) \
-        .get("model_override", "")
-    semantic["app_default_model"] = _app_default_model()
+    lov = _lovense.status()
+    jev = {**_jev_host_status(), **_director.status()}
     return {
         "module": MODULE_ID,
         "hooks_available": _hooks_available,
         "story_enabled": _story_enabled,
-        "trigger_mode": _mode(),
         "vibe_on": _vibe.vibe_on,
         "level": m["level"],
         "envelope": m["envelope"],
+        "story_cap": m["story_cap"],
         "vibe": m["vibe"],
+        "preview": m["preview"],
+        "lovense": lov,
         "backends": m["backends"],
-        "semantic": semantic,
+        "jev": jev,
     }
+
+
+def _patterns_catalog() -> list[dict]:
+    cfg = _store.config()
+    enabled_set = set(cfg.get("enabled_patterns") or PATTERNS)
+    contrast_mode = str(cfg.get("contrast_mode", "balanced"))
+    items = []
+    for pat_id in PATTERNS:
+        spec = PATTERN_SPECS[pat_id]
+        items.append({
+            **spec,
+            "enabled": pat_id in enabled_set,
+            "curve_moderate": sample_pattern_curve(
+                pat_id, duration_s=6.0, steps=84, intensity=58.0, contrast_mode=contrast_mode
+            ),
+            "curve_high": sample_pattern_curve(
+                pat_id, duration_s=6.0, steps=84, intensity=92.0, contrast_mode=contrast_mode
+            ),
+        })
+    return items
 
 
 # --------------------------------------------------------------------- router
@@ -252,82 +363,161 @@ def _sanitize_config(updates: dict) -> dict:
             return min(max(float(value), lo), hi)
         except (TypeError, ValueError):
             return fallback
-    out = {}
+
+    out: dict = {}
     if isinstance(updates.get("lovense"), dict):
         lov = updates["lovense"]
-        out["lovense"] = {k: lov[k] for k in
-                          ("enabled", "host", "port", "use_time_sec_safety")
-                          if k in lov}
-        if "port" in out["lovense"]:
-            out["lovense"]["port"] = int(clamp(out["lovense"]["port"], 1, 65535, 20010))
-    if isinstance(updates.get("buttplug"), dict):
-        bp = updates["buttplug"]
-        out["buttplug"] = {k: bp[k] for k in ("enabled", "url") if k in bp}
+        lov_out: dict = {}
+        if "enabled" in lov:
+            lov_out["enabled"] = bool(lov["enabled"])
+        if "host" in lov:
+            https, host, port = normalize_endpoint(
+                str(lov["host"] or ""),
+                lov.get("port", _store.config().get("lovense", {}).get("port", 20010)),
+                lov.get("https", _store.config().get("lovense", {}).get("https", False)),
+            )
+            lov_out["host"] = host
+            # If user pasted host:port or https://host:port, carry port/https over
+            if ":" in str(lov["host"] or "") or "://" in str(lov["host"] or ""):
+                lov_out["port"] = int(clamp(port, 1, 65535, 20010))
+                lov_out["https"] = bool(https)
+        if "port" in lov and "port" not in lov_out:
+            lov_out["port"] = int(clamp(lov["port"], 1, 65535, 20010))
+        if "https" in lov and "https" not in lov_out:
+            lov_out["https"] = bool(lov["https"])
+        if lov.get("action_mode") in ("All", "Vibrate"):
+            lov_out["action_mode"] = lov["action_mode"]
+        if "use_time_sec_safety" in lov:
+            lov_out["use_time_sec_safety"] = bool(lov["use_time_sec_safety"])
+        if lov_out:
+            out["lovense"] = lov_out
+
     if "master_cap_global" in updates:
         out["master_cap_global"] = clamp(updates["master_cap_global"], 0, 100, 100)
-    if "ramp_ms" in updates:
-        out["ramp_ms"] = clamp(updates["ramp_ms"], 0, 10000, 500)
-    if "tick_hz" in updates:
-        out["tick_hz"] = clamp(updates["tick_hz"], 1, 30, 10)
+    if updates.get("contrast_mode") in CONTRAST_MODES:
+        out["contrast_mode"] = updates["contrast_mode"]
+    if updates.get("response_feel") in ("silky", "natural", "snappy"):
+        out["response_feel"] = updates["response_feel"]
     if "stop_on_turn_end" in updates:
         out["stop_on_turn_end"] = bool(updates["stop_on_turn_end"])
-    if updates.get("trigger_mode") in ("hybrid", "keywords", "semantic"):
-        out["trigger_mode"] = updates["trigger_mode"]
-    if isinstance(updates.get("semantic"), dict):
-        sem = updates["semantic"]
-        out["semantic"] = {}
-        if "model_override" in sem:
-            out["semantic"]["model_override"] = str(sem["model_override"] or "").strip()
-        if "window_chars" in sem:
-            out["semantic"]["window_chars"] = int(clamp(sem["window_chars"], 100, 4000, 600))
-        if "timeout_s" in sem:
-            out["semantic"]["timeout_s"] = clamp(sem["timeout_s"], 1, 30, 4)
+    if "tick_hz" in updates:
+        out["tick_hz"] = int(clamp(updates["tick_hz"], 5, 30, 20))
+    if isinstance(updates.get("enabled_patterns"), list):
+        valid = [p for p in updates["enabled_patterns"] if p in PATTERNS]
+        if valid:
+            out["enabled_patterns"] = valid
+    if isinstance(updates.get("jev"), dict):
+        j = updates["jev"]
+        jev_out: dict = {}
+        if "min_interval_s" in j:
+            jev_out["min_interval_s"] = clamp(j["min_interval_s"], 0.5, 10.0, 1.8)
+        if "sensitivity" in j:
+            jev_out["sensitivity"] = clamp(j["sensitivity"], 0.5, 1.5, 1.0)
+        if jev_out:
+            out["jev"] = jev_out
     return out
-
-
-async def _sync_buttplug() -> None:
-    if _buttplug.enabled:
-        _buttplug.start()
-    else:
-        await _buttplug.disconnect()
 
 
 def get_router():
     from fastapi import APIRouter, HTTPException
+
     router = APIRouter()
 
     @router.get("/status")
     async def status():
         return _status()
 
+    @router.get("/patterns")
+    async def patterns():
+        return {"patterns": _patterns_catalog()}
+
     @router.post("/stop")
     async def stop():
+        _director.invalidate()
         await _manager.instant_stop()
         return {"ok": True, "status": _status()}
 
     @router.post("/toggle")
     async def toggle():
         await _manager.set_gate(not _vibe.vibe_on)
-        return {"ok": True, "vibe_on": _vibe.vibe_on}
+        return {"ok": True, "vibe_on": _vibe.vibe_on, "status": _status()}
 
     @router.post("/manual")
     async def manual(body: dict | None = None):
-        """Manual drive (floating-button velocity mode): sets the latch
-        directly. Un-mutes — wiggling the button is explicit intent."""
+        payload = body or {}
         try:
-            strength = min(max(float((body or {}).get("strength", 0)), 0.0), 100.0)
+            strength = min(max(float(payload.get("strength", 0)), 0.0), 100.0)
         except (TypeError, ValueError):
             strength = 0.0
+        pat = normalize_pattern(payload.get("pattern") or _director.pattern_override or _vibe.pattern)
+        pace = payload.get("pace")
+        _director.invalidate()
         _vibe.set_gate(True)
-        _vibe.set_target(strength, "constant", None, source="manual:drive")
+        _vibe.set_target(strength, pat, source=f"manual:{pat}", pace=pace)
         _manager.ensure_running()
-        return {"ok": True, "strength": strength}
+        return {"ok": True, "strength": strength, "pattern": pat, "status": _status()}
+
+    @router.post("/pattern-override")
+    async def set_pattern_override(body: dict | None = None):
+        raw = (body or {}).get("pattern")
+        if not raw or str(raw).lower() in ("auto", "none", ""):
+            _director.pattern_override = None
+        else:
+            pat = normalize_pattern(str(raw))
+            _director.pattern_override = pat
+            if _vibe.strength > 0:
+                _vibe.set_target(_vibe.strength, pat, source=f"override:{pat}")
+        return {"ok": True, "pattern_override": _director.pattern_override, "status": _status()}
+
+    @router.post("/preview")
+    async def preview(body: dict | None = None):
+        payload = body or {}
+        pat = normalize_pattern(payload.get("pattern") or "crest")
+        try:
+            strength = float(payload.get("strength", 65))
+        except (TypeError, ValueError):
+            strength = 65.0
+        try:
+            seconds = float(payload.get("seconds", 4.0))
+        except (TypeError, ValueError):
+            seconds = 4.0
+        pace = payload.get("pace")
+        _vibe.set_gate(True)
+        _manager.ensure_running()
+        _manager.start_preview(strength=strength, pattern=pat, seconds=seconds, pace=pace)
+        return {"ok": True, "status": _status()}
 
     @router.post("/test")
     async def test(body: dict | None = None):
-        strength = float((body or {}).get("strength", 50))
+        payload = body or {}
+        try:
+            strength = float(payload.get("strength", 55))
+        except (TypeError, ValueError):
+            strength = 55.0
+        pat = normalize_pattern(payload.get("pattern") or "crest")
+        _vibe.set_gate(True)
         _manager.ensure_running()
-        _spawn(_manager.test_buzz(strength))
+        _manager.start_preview(strength=strength, pattern=pat, seconds=2.0)
+        return {"ok": True}
+
+    @router.post("/story-sync")
+    async def story_sync(body: dict | None = None):
+        payload = body or {}
+        enabled = bool(payload.get("enabled", True))
+        try:
+            cap = float(payload.get("master_cap", 70))
+        except (TypeError, ValueError):
+            cap = 70.0
+        save_id = payload.get("save_id")
+        await _apply_story_config(enabled=enabled, master_cap=cap, save_id=save_id)
+        return {"ok": True, "status": _status()}
+
+    @router.post("/story-leave")
+    async def story_leave():
+        """Silence story-driven output when exiting a story back to the main menu."""
+        _director.invalidate()
+        if not _manager.preview_active:
+            await _manager.instant_stop()
         return {"ok": True}
 
     @router.get("/config")
@@ -336,69 +526,56 @@ def get_router():
 
     @router.put("/config")
     async def put_config(body: dict):
-        merged = _store.save_config(_sanitize_config(body or {}))
-        await _sync_buttplug()
-        return merged
+        return _store.save_config(_sanitize_config(body or {}))
 
-    @router.get("/rules")
-    async def get_rules():
-        return _store.rules()
-
-    @router.put("/rules")
-    async def put_rules(body: dict):
-        if not isinstance(body, dict) or not isinstance(body.get("rules"), list):
-            raise HTTPException(422, "expected {categories: {...}, rules: [...]}")
-        return _store.save_rules(body)
-
-    @router.post("/rules/test")
-    async def rules_test(body: dict):
-        """Tester box: what would this paragraph do? Keyword matches always;
-        one semantic classification only when asked (it costs an LLM call)."""
-        text = str((body or {}).get("text", ""))
-        result = {"keyword_effects": _scanner.scan_full_text(text)}
-        if (body or {}).get("semantic"):
-            try:
-                raw = await asyncio.wait_for(
-                    _classify_call(_semantic_probe_prompt(text)),
-                    float(_store.config().get("semantic", {}).get("timeout_s", 4)))
-                result["semantic_verdict"] = _semantic._parse(raw)
-            except Exception as e:
-                result["semantic_error"] = f"{type(e).__name__}: {e}"
-        return result
-
+    @router.post("/lovense/connect")
     @router.post("/backends/{name}/connect")
-    async def connect(name: str):
-        if name == "lovense":
-            ok = await _lovense.probe()
-            return {"ok": ok, "backend": _lovense.status()}
-        if name == "buttplug":
-            _buttplug.start()
-            for _ in range(20):               # give the handshake a moment
-                if _buttplug.connected:
-                    break
-                await asyncio.sleep(0.1)
-            return {"ok": _buttplug.connected, "backend": _buttplug.status()}
-        raise HTTPException(404, f"unknown backend {name!r}")
+    async def connect(name: str = "lovense", body: dict | None = None):
+        if name != "lovense":
+            raise HTTPException(404, f"unknown backend {name!r}")
+        if isinstance(body, dict) and body:
+            _store.save_config(_sanitize_config({"lovense": body}))
+        found = await _lovense.probe(auto_discover=True)
+        if found:
+            _store.save_config({"lovense": found})
+            _manager.ensure_running()
+        return {"ok": bool(found), "backend": _lovense.status(), "config": _store.config()}
 
+    @router.post("/lovense/disconnect")
     @router.post("/backends/{name}/disconnect")
-    async def disconnect(name: str):
-        if name == "lovense":
-            await _lovense.aclose()
-            return {"ok": True}
-        if name == "buttplug":
-            await _buttplug.disconnect()
-            return {"ok": True}
-        raise HTTPException(404, f"unknown backend {name!r}")
+    async def disconnect(name: str = "lovense"):
+        if name != "lovense":
+            raise HTTPException(404, f"unknown backend {name!r}")
+        await _manager.instant_stop()
+        await _lovense.aclose()
+        return {"ok": True, "backend": _lovense.status()}
+
+    @router.post("/jev/enable")
+    async def enable_jev():
+        svc = _jev_service()
+        if svc is None or not hasattr(svc, "save"):
+            raise HTTPException(503, "JEV service is not available on this WorldboxAI build.")
+        svc.save({"enabled": True})
+        return {"ok": True, "jev": _jev_host_status()}
+
+    @router.post("/jev/test-prose")
+    async def test_prose(body: dict | None = None):
+        payload = body or {}
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise HTTPException(422, "Provide non-empty prose text to test.")
+        res = await _director.probe_prose(text)
+        if res.get("ok") and payload.get("feel") and res["verdict"]["action"] == "apply":
+            v = res["verdict"]
+            if v["strength"] > 0:
+                _vibe.set_gate(True)
+                _manager.ensure_running()
+                _manager.start_preview(
+                    strength=v["strength"],
+                    pattern=v["pattern"],
+                    seconds=3.5,
+                    pace=v["pace"],
+                )
+        return res
 
     return router
-
-
-def _semantic_probe_prompt(text: str) -> str:
-    from toylink.semantic_engine import PROMPT_TEMPLATE
-    ruleset = _store.ruleset()
-    lines = []
-    for name, cat in ruleset.categories.items():
-        strength = cat.get("strength", 0)
-        hint = " (this means: stop / wind down)" if not strength else ""
-        lines.append(f'- "{name}": strength {strength}{hint}')
-    return PROMPT_TEMPLATE.format(categories="\n".join(lines), window=text)

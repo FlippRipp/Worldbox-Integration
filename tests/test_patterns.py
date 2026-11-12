@@ -1,43 +1,12 @@
-from toylink.patterns import DEFAULT_PARAMS, VibeState, pattern_multiplier
+import pytest
 
-
-def test_constant_is_flat():
-    assert pattern_multiplier("constant", 0.0) == 1.0
-    assert pattern_multiplier("constant", 123.4) == 1.0
-
-
-def test_unknown_pattern_behaves_as_constant():
-    assert pattern_multiplier("wobble", 1.0) == 1.0
-
-
-def test_pulse_on_off_timing():
-    params = {"pulse_on_ms": 400, "pulse_off_ms": 250}
-    assert pattern_multiplier("pulse", 0.0, params) == 1.0
-    assert pattern_multiplier("pulse", 0.399, params) == 1.0
-    assert pattern_multiplier("pulse", 0.401, params) == 0.0
-    assert pattern_multiplier("pulse", 0.649, params) == 0.0
-    # next cycle
-    assert pattern_multiplier("pulse", 0.651, params) == 1.0
-
-
-def test_wave_starts_low_and_stays_in_range():
-    params = {"wave_low_pct": 30, "wave_period_ms": 2000}
-    low = pattern_multiplier("wave", 0.0, params)
-    assert abs(low - 0.30) < 1e-9
-    peak = pattern_multiplier("wave", 1.0, params)  # half period = peak
-    assert abs(peak - 1.0) < 1e-9
-    for t in (0.1, 0.5, 0.9, 1.3, 1.7):
-        v = pattern_multiplier("wave", t, params)
-        assert 0.30 - 1e-9 <= v <= 1.0 + 1e-9
-
-
-def test_param_defaults_apply_when_missing():
-    # No params at all: pulse uses the documented defaults.
-    on = DEFAULT_PARAMS["pulse_on_ms"] / 1000.0
-    assert pattern_multiplier("pulse", on - 0.001) == 1.0
-    assert pattern_multiplier("pulse", on + 0.001) == 0.0
-    # None values inherit the default rather than crashing.
-    assert pattern_multiplier("pulse", 0.0, {"pulse_on_ms": None}) == 1.0
+from toylink.patterns import (
+    PATTERNS,
+    VibeState,
+    normalize_pattern,
+    pattern_multiplier,
+    sample_pattern_curve,
+)
 
 
 class FakeClock:
@@ -48,53 +17,101 @@ class FakeClock:
         return self.t
 
 
-def test_vibestate_latch_and_clamp():
+@pytest.mark.parametrize("pat", PATTERNS)
+def test_all_patterns_bounded_and_smooth(pat):
+    samples = sample_pattern_curve(pat, duration_s=8.0, steps=160, intensity=85.0)
+    assert len(samples) == 160
+    assert all(0.0 <= s <= 1.0 for s in samples)
+    # Smoothness: no instant 0->1 square-cliff spikes within a single 50 ms step
+    diffs = [abs(samples[i + 1] - samples[i]) for i in range(len(samples) - 1)]
+    assert max(diffs) < 0.45
+
+
+def test_legacy_aliases_and_unknown_normalize_cleanly():
+    assert normalize_pattern("constant") == "velvet"
+    assert normalize_pattern("wave") == "swell"
+    assert normalize_pattern("pulse") == "rhythm"
+    assert normalize_pattern("nonexistent") == "velvet"
+    assert normalize_pattern(None) == "velvet"
+
+
+def test_high_intensity_applies_high_medium_contrast_without_zero_drops():
+    """At high intensity, patterns should cycle rapidly between High and Medium
+    to prevent numbing — neither clamping flat nor dropping all the way to 0."""
+    crest_hi = sample_pattern_curve("crest", duration_s=4.0, steps=80, intensity=100.0, contrast_mode="high")
+    assert max(crest_hi) >= 0.88
+    # Troughs stay in the Medium band (~0.35-0.62), never dropping near 0
+    assert 0.34 <= min(crest_hi) <= 0.65
+    # Verify rapid High↔Medium crossings (several cycles across 4 seconds)
+    mid = 0.70
+    crossings = sum(
+        1 for i in range(len(crest_hi) - 1) if (crest_hi[i] < mid) != (crest_hi[i + 1] < mid)
+    )
+    assert crossings >= 10
+
+    # Even Velvet (gentle caress at low intensity) engages contrast shimmer at 95%
+    velvet_mod = sample_pattern_curve("velvet", duration_s=3.0, steps=60, intensity=45.0)
+    velvet_hi = sample_pattern_curve("velvet", duration_s=3.0, steps=60, intensity=95.0, contrast_mode="high")
+    mod_rel_span = (max(velvet_mod) - min(velvet_mod)) / 0.45
+    hi_rel_span = (max(velvet_hi) - min(velvet_hi)) / 0.95
+    assert hi_rel_span > mod_rel_span * 1.4
+
+
+def test_phrase_variation_evolves_across_windows():
+    """Adjacent multi-second windows should vary organically rather than
+    repeating an identical static loop."""
+    s = sample_pattern_curve("swell", duration_s=14.0, steps=280, intensity=75.0)
+    first_window = s[:100]
+    second_window = s[100:200]
+    assert first_window != second_window
+
+
+def test_phase_continuity_when_strength_or_pace_updates():
     clock = FakeClock()
     vs = VibeState(clock=clock)
-    vs.set_target(150, "pulse", {"pulse_on_ms": 100, "pulse_off_ms": 100}, source="test")
-    assert vs.strength == 100.0
-    vs.set_target(-5)
+    vs.set_target(60, "swell", pace=0.4)
+    for _ in range(15):
+        vs.advance_and_sample(0.05, 0.60)
+    saved_phase = vs.phase
+    assert saved_phase > 0.1
+
+    # Updating strength and pace mid-stream MUST NOT reset oscillator phase to 0
+    vs.set_target(85, "swell", pace=0.75)
+    assert vs.phase == pytest.approx(saved_phase)
+
+
+def test_pattern_switch_crossfades_smoothly():
+    clock = FakeClock()
+    vs = VibeState(clock=clock)
+    vs.set_target(80, "velvet")
+    for _ in range(10):
+        vs.advance_and_sample(0.05, 0.80)
+    before = vs.advance_and_sample(0.0, 0.80)
+
+    vs.set_target(80, "tease")
+    assert vs._prev_pattern == "velvet"
+    assert vs._xfade == 0.0
+    # At t=0 of switch, output starts right at the previous pattern's value (no click!)
+    at_switch = vs.advance_and_sample(0.0, 0.80)
+    assert at_switch == pytest.approx(before, abs=1e-6)
+
+    # After >0.35s, crossfade finishes cleanly
+    for _ in range(10):
+        vs.advance_and_sample(0.05, 0.80)
+    assert vs._prev_pattern is None
+    assert vs._xfade == 1.0
+
+
+def test_afterglow_decays_to_silence():
+    clock = FakeClock()
+    vs = VibeState(clock=clock)
+    vs.set_target(45, "afterglow")
+    for _ in range(200):  # 10 seconds at 20 Hz
+        vs.advance_and_sample(0.05, vs.strength / 100.0)
     assert vs.strength == 0.0
-    vs.set_target(85, "nonsense")
-    assert vs.pattern == "constant"
+    assert vs.source == "afterglow:complete"
 
 
-def test_vibestate_target_multiplier_tracks_pattern_phase():
-    clock = FakeClock()
-    vs = VibeState(clock=clock)
-    vs.set_target(80, "pulse", {"pulse_on_ms": 400, "pulse_off_ms": 250})
-    assert vs.target_multiplier() == 80.0     # phase 0 = on
-    clock.t += 0.5                            # into the off part
-    assert vs.target_multiplier() == 0.0
-    clock.t += 0.2                            # next cycle, on again
-    assert vs.target_multiplier() == 80.0
-
-
-def test_vibestate_phase_resets_on_new_target():
-    clock = FakeClock()
-    vs = VibeState(clock=clock)
-    vs.set_target(80, "pulse", {"pulse_on_ms": 400, "pulse_off_ms": 250})
-    clock.t += 0.5
-    assert vs.target_multiplier() == 0.0
-    vs.set_target(60, "pulse", {"pulse_on_ms": 400, "pulse_off_ms": 250})
-    assert vs.target_multiplier() == 60.0     # fresh latch starts "on"
-
-
-def test_vibestate_apply_effect_and_clear():
-    vs = VibeState(clock=FakeClock())
-    vs.apply_effect({"rule_id": "r_kiss", "category": "gentle", "strength": 30,
-                     "pattern": "constant", "params": {}}, source_prefix="keyword:")
-    assert vs.strength == 30.0
-    assert vs.source == "keyword:r_kiss"
-    v = vs.version
-    vs.clear()
-    assert vs.strength == 0.0 and vs.version > v
-
-
-def test_vibestate_gate_changes_version_only_on_flip():
-    vs = VibeState(clock=FakeClock())
-    v = vs.version
-    vs.set_gate(True)          # already on: no-op
-    assert vs.version == v
-    vs.set_gate(False)
-    assert vs.vibe_on is False and vs.version == v + 1
+def test_stateless_pattern_multiplier_helper():
+    v = pattern_multiplier("heartbeat", 0.5, {"pace": 0.5})
+    assert 0.0 <= v <= 1.0

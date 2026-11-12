@@ -1,106 +1,57 @@
-# Toy Link (`wb_toy_link`) — haptics for WorldboxAI
+# Toy Link (`wb_toy_link`) — JEV-Steered Lovense Haptics for WorldboxAI
 
-A drop-in [WorldboxAI](https://github.com/FlippRipp/WorldboxAI) module that
-drives sex toys from the story in real time. As the storyteller streams prose,
-keyword and AI-based triggers set a latched vibration state — intensity and
-pattern — that plays on every connected device until the story (or you) change
-it.
+A drop-in [WorldboxAI](https://github.com/FlippRipp/WorldboxAI) module that drives Lovense toys from story narration in real time, steered by **JEV** and a **procedural anti-numbing pattern engine**.
 
-**18+.** Everything here assumes informed, consenting adult use of your own
-devices.
+**18+.** Everything here assumes informed, consenting adult use of your own devices.
 
-## What it does
+## Highlights
 
-- **Two device backends, usable together:**
-  - **Lovense Remote (Game Mode)** — direct local HTTP to the phone running
-    Lovense Remote. Preferred: no extra software on the host.
-  - **Intiface Central / buttplug.io** — websocket to Intiface (desktop or
-    Android), which talks to almost any BLE toy.
-- **Triggers while the prose streams** (hybrid mode, the default):
-  - *Keywords* match instantly (<300 ms) — exact words/phrases mapped to
-    categories (gentle / moderate / intense / peak / calm), each with a
-    strength and a waveform pattern (constant, pulse, wave).
-  - *The AI classifier* re-judges the scene every sentence or two using a
-    small LLM and overrides the keyword guess — it understands negation,
-    memories, and paraphrase. A calm verdict winds everything down.
-- **Latched state, no timers**: the mood persists while you read and type.
-  Intensity changes ramp smoothly (`ramp_ms`); nothing expires on its own.
-- **Safety first**: master intensity caps (global × per-story), a prominent
-  STOP everywhere, instant halt when you cancel a turn, and a Lovense
-  `timeSec` keepalive so even a crashed host stops the toy within ~2 s.
-- **A floating on/off button** you can drag anywhere: tap to mute (devices go
-  silent, the story keeps tracking), tap again to ramp back to the scene's
-  current intensity. **Hold it still for a moment, then drag** to enter manual
-  drive: strength follows your hand speed — wiggle fast for more, stop moving
-  to fade out, release mid-motion to hold that level.
-- **Toy Studio** — a main-menu screen with all settings: devices, trigger
-  rules (with a paste-a-paragraph tester), classifier model, caps.
-
-## Requirements
-
-- A WorldboxAI build with the **streaming module API**
-  (`MODULE_API_FEATURES ⊇ {stream_tokens, turn_lifecycle}` — present in
-  current WorldboxAI). On an older build the module loads but stays inactive
-  and says so in its status.
-- No extra Python packages — the module only uses `httpx` and `websockets`,
-  which WorldboxAI already ships. Works on desktop and on Android/Termux
-  installs.
+- **JEV-steered in ~200 ms**:
+  - Uses WorldboxAI's typed JEV decision engine (`engaged`, `wind_down`, `intensity`, `pace`, `pattern`) to read physical momentum as narration streams.
+  - Understands negations, past memories, and scene transitions out of the box — no brittle keyword lists or slow chat-LLM refusals.
+  - Computes **probability-weighted analog intensity and tempo**, so intensity swells smoothly instead of jumping in coarse steps.
+- **Procedural Pattern Engine (`velvet`, `swell`, `heartbeat`, `tease`, `rhythm`, `crest`, `afterglow`)**:
+  - **Phase-continuous oscillators** with smooth 350 ms crossfades when patterns change.
+  - **Golden-ratio dual-LFO phrasing** (~9 s and ~14.5 s cycles) for organic, non-chaotic variation across waves.
+  - **High↔Medium anti-numbing contrast**: as intensity enters the high zone, patterns lift deep troughs to Medium (~46–56%) and cycle briskly (~1.8–3.3 Hz, matched to Lovense motor physics on a 20 Hz loop) between High and Medium so sensation stays sharp instead of numbing out.
+  - **Automatic `afterglow` wind-down**: gently fades out over ~9 s when an intimate moment settles.
+- **Effortless Lovense setup**:
+  - Works with **Lovense Remote** (iOS/Android Game Mode) and **Lovense Connect** (PC `127.0.0.1`).
+  - Automatically discovers HTTP (`20010` / `34567`) and local HTTPS (`30010` / `34568`), drives all actuators (`All:0-20`), deduplicates 0–20 steps, and uses a 2 s safety keepalive so a crashed host never leaves a toy running.
+- **Clean UI & Zero-Lag Floating Toggle**:
+  - **Toy Studio** (Main Menu): 3 clean cards — *Lovense Connection*, *JEV Steering & Feel*, and an interactive *Dynamic Pattern Gallery* with live SVG waveforms and `▶ Feel` buttons.
+  - **In-Story Sidebar & Floating Orb**: GPU-composited `translate3d` drag positioning, one-tap Mute/Resume, quick pattern override, and in-story Lovense reconnect.
 
 ## Install
 
-```sh
-git clone https://github.com/FlippRipp/Worldbox-Sex-Toy-Integration- toy-link
-cd toy-link
-./install.sh /path/to/WorldboxAI        # or install.bat on Windows
+```bat
+install.bat K:\Python\AI\Worldbox
+```
+(Or `./install.sh /path/to/WorldboxAI` on Linux/macOS/Termux.) Restart WorldboxAI afterwards.
+
+## Setup
+
+1. Enable **JEV decisions** in WorldboxAI Model Settings (or click **Enable JEV Now** inside Toy Studio).
+2. Open **Lovense Remote** on your phone → *Discover* → *Game Mode* (or start **Lovense Connect** on PC).
+3. Open **Toy Studio** from WorldboxAI's main menu, enter the Local IP (or click **This PC**), and hit **Connect**.
+
+## Slash Commands
+
+In chat:
+```text
+/toys status
+/toys stop
+/toys off | on
+/toys test [0-100] [pattern]
+/toys pattern <velvet|swell|heartbeat|tease|rhythm|crest|afterglow|auto>
 ```
 
-(That just symlinks `wb_toy_link/` into `WorldboxAI/modules/` — `--copy`
-copies instead. Restart the backend afterwards.)
-
-## Device setup
-
-**Lovense:** open Lovense Remote on your phone → Discover → Game Mode →
-enable. Enter the IP it shows into Toy Studio → Devices and hit *Connect*.
-Phone and WorldboxAI host must be on the same network — or be the same phone:
-on a Termux install, `127.0.0.1` with Lovense Remote on the same device.
-
-**Intiface:** run Intiface Central (desktop or the Android app), start the
-server, connect your toys, then enable the backend in Toy Studio (default
-`ws://127.0.0.1:12345`).
-
-## Use
-
-- Sidebar widget: status per backend, live intensity bar, STOP, mute, test.
-- Floating button: drag it wherever you like; tap toggles vibration;
-  hold-then-drag drives strength by hand speed (manual mode).
-- `/toys` in the chat composer: `stop | on | off | test [0-100] | status`.
-- Toy Studio (main menu): everything configurable, including the trigger
-  rules and their categories. The tester box shows exactly what a paragraph
-  would trigger before it ever touches a device.
-
-## The AI classifier and your model choice
-
-In hybrid/AI mode the module sends the last few hundred characters of prose
-to an LLM for classification: by default the app's *module fast model* (set in
-provider settings), optionally a **custom model just for this module** (Toy
-Studio → Classifier model).
-
-- The model must be comfortable with explicit prose. A model that refuses
-  just fails quiet — you silently fall back to keywords-only.
-- Privacy: prose excerpts go to whatever provider serves the chosen model —
-  the same trust domain as the storyteller itself, which already sees the
-  whole story. Keywords-only mode makes no LLM calls at all.
-- Cost: typically well under a cent per turn with a fast model.
-
-## Development
+## Development & Tests
 
 ```sh
-pip install -r requirements-dev.txt
-python -m pytest                # standalone, no WorldboxAI checkout needed
-python tools/dev_console.py     # type prose, watch trigger decisions live
+python -m pytest
+python tools/dev_console.py --lovense 192.168.1.42
 ```
-
-The design/plan documents live in `docs/`.
 
 ## License
 

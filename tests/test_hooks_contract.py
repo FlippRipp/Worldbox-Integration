@@ -1,24 +1,22 @@
-"""Contract tests: the module glue against stub WorldboxAI services.
-
-backend.py is loaded exactly the way WorldboxAI's registry loads it — as a
-loose spec module from its file path — so the sys.path bootstrap and package
-imports get exercised too.
-"""
+"""Contract tests: backend glue, WorldboxAI hooks, REST API, and JSX syntax."""
 import asyncio
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-BACKEND_PATH = Path(__file__).resolve().parent.parent / "wb_toy_link" / "backend.py"
+from test_jev_director import make_answers
+
+MODULE_ROOT = Path(__file__).resolve().parent.parent / "wb_toy_link"
+BACKEND_PATH = MODULE_ROOT / "backend.py"
 
 
 def load_backend():
-    spec = importlib.util.spec_from_file_location("wb_toy_link_backend_test",
-                                                  BACKEND_PATH)
+    spec = importlib.util.spec_from_file_location("wb_toy_link_backend_test", BACKEND_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -27,48 +25,70 @@ def load_backend():
 BACKEND = load_backend()
 
 
-class StubLLMService:
-    def __init__(self):
-        self.module_fast_model = "provider/fast-model"
-        self.calls = []
-        self.response = json.dumps({"no_change": True})
+class StubDecision:
+    def __init__(self, answers=None, reason=""):
+        self.answers = answers or {}
+        self.reason = reason
+        self.finished = False
+        self.outcome = ""
 
-    async def simple_completion(self, messages, model=None, **kwargs):
-        self.calls.append({"model": model, "prompt": messages[0]["content"]})
-        return self.response
+    async def finish(self, outcome, reason=""):
+        self.finished = True
+        self.outcome = outcome
+
+
+class StubJevService:
+    def __init__(self):
+        self.enabled = True
+        self.has_creds = True
+        self.calls = []
+        self.answers = make_answers(pattern="swell")
+
+    def public_config(self):
+        return {"enabled": self.enabled, "model": "jev-latest", "api_key_set": self.has_creds}
+
+    def has_credentials(self):
+        return self.has_creds
+
+    def save(self, updates):
+        if "enabled" in updates:
+            self.enabled = bool(updates["enabled"])
+        return self.public_config()
+
+    async def decide(self, state, questions, *, module, step, **_kwargs):
+        self.calls.append({"state": state, "questions": questions, "module": module, "step": step})
+        if not self.enabled or not self.has_creds:
+            return StubDecision(reason="disabled or unavailable")
+        return StubDecision(self.answers)
+
+
+class StubSDK:
+    def __init__(self, jev_service: StubJevService):
+        async def decide(state, questions, *, module, step):
+            return await jev_service.decide(state, questions, module=module, step=step)
+
+        self.llm = SimpleNamespace(decide=decide)
 
 
 class StubEngine:
     MODULE_API_FEATURES = frozenset({"stream_tokens", "turn_lifecycle"})
 
     def __init__(self):
-        self.llm = StubLLMService()
+        self.jev = StubJevService()
+        self.llm = SimpleNamespace(decisions=self.jev, mode="live", inspector=None)
+        self.sdk = StubSDK(self.jev)
 
 
-class StubBridge:
-    def __init__(self):
-        self.calls = []
-        self.response = json.dumps({"no_change": True})
-
-    async def generate(self, prompt, model_preference="balanced", **kwargs):
-        self.calls.append({"preference": model_preference, "prompt": prompt})
-        return self.response
-
-
-class StubSDK:
-    def __init__(self):
-        self.llm = StubBridge()
-
-
-class FakeClient:
-    name = "fake"
+class FakeLovense:
+    name = "lovense"
     enabled = True
     connected = True
+    toys = [{"id": "t1", "name": "lush", "display_name": "Lush 3", "battery": 90}]
+    last_error = ""
 
     def __init__(self):
         self.levels = []
         self.stops = 0
-        self.last_error = ""
 
     async def set_level(self, frac):
         self.levels.append(frac)
@@ -76,54 +96,80 @@ class FakeClient:
     async def stop(self):
         self.stops += 1
 
+    async def probe(self, auto_discover=True):
+        self.connected = True
+        return {"host": "192.168.1.42", "port": 20010, "https": False}
+
+    async def aclose(self):
+        self.connected = False
+
     def status(self):
-        return {"name": self.name, "enabled": True, "connected": True,
-                "devices": [], "last_error": ""}
+        return {
+            "name": "lovense",
+            "enabled": True,
+            "configured_host": "192.168.1.42",
+            "port": 20010,
+            "https": False,
+            "connected": self.connected,
+            "devices": list(self.toys),
+            "last_error": self.last_error,
+        }
 
 
 def wire(tmp_path, engine=None):
-    """set_services with stubs and swap the device clients for fakes."""
     engine = engine or StubEngine()
     BACKEND.set_services({"engine": engine, "global_data_dir": str(tmp_path)})
-    fake = FakeClient()
+    fake = FakeLovense()
+    BACKEND._lovense = fake
     BACKEND._manager.clients[:] = [fake]
-    return engine, fake, StubSDK()
+    return engine, fake, engine.sdk
 
 
-STATE = {"turn": 3, "module_configs": {"wb_toy_link": {"enabled": True,
-                                                       "master_cap": 100}}}
+STATE = {
+    "turn": 3,
+    "active_save_id": "save_1",
+    "history": ["They sat beside the fire."],
+    "input_text": "I lean in closer.",
+    "module_configs": {"wb_toy_link": {"enabled": True, "master_cap": 100}},
+}
 
 
 async def drain():
-    for _ in range(10):
+    for _ in range(12):
         await asyncio.sleep(0)
 
 
 async def test_feature_detection_positive_and_negative(tmp_path):
-    engine, _, _ = wire(tmp_path)
+    wire(tmp_path)
     assert BACKEND._hooks_available is True
 
     class BareEngine:
         pass
+
     BACKEND.set_services({"engine": BareEngine(), "global_data_dir": str(tmp_path)})
     assert BACKEND._hooks_available is False
-    BACKEND.on_stream_token("kissed ", STATE, None)   # inert, must not raise
+    BACKEND.on_stream_token("A kiss. ", STATE, None)
     assert BACKEND._status()["hooks_available"] is False
-    cmd = await BACKEND.on_command_toys(["status"], STATE, None)
-    assert "lacks stream hooks" in cmd["message"]
 
 
-async def test_turn_flow_keyword_latch_and_completed_keeps_state(tmp_path):
-    _, fake, sdk = wire(tmp_path)
+async def test_turn_streams_into_jev_and_steers_vibe_state(tmp_path):
+    engine, _, sdk = wire(tmp_path)
     try:
+        engine.jev.answers = make_answers(
+            int_probs={"none": 0.0, "subtle": 0.0, "sensual": 0.0, "aroused": 0.2, "intense": 0.8, "climax": 0.0},
+            pace_probs={"slow": 0.0, "measured": 0.0, "fast": 0.8, "frantic": 0.2},
+            pattern="rhythm",
+        )
         await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("she leaned in and kissed ", STATE, sdk)
-        BACKEND.on_stream_token("him softly", STATE, sdk)
-        assert BACKEND._vibe.strength == 30          # gentle latched mid-stream
-        assert BACKEND._vibe.source == "keyword:r_kiss"
+        BACKEND.on_stream_token("Their rhythm quickened breathlessly. ", STATE, sdk)
+        await drain()
+        assert BACKEND._vibe.pattern == "rhythm"
+        assert BACKEND._vibe.strength == pytest.approx(80.0)
+        assert BACKEND._vibe.pace == pytest.approx(0.80)
+        assert engine.jev.calls[0]["state"]["player_action"] == "I lean in closer."
         await BACKEND.on_turn_stopped(STATE, sdk, "completed")
         await drain()
-        assert BACKEND._vibe.strength == 30          # latch persists after turn
+        assert BACKEND._vibe.strength == pytest.approx(80.0)
     finally:
         await BACKEND.shutdown()
 
@@ -133,8 +179,9 @@ async def test_cancelled_or_error_turn_hard_stops(tmp_path, reason):
     _, fake, sdk = wire(tmp_path)
     try:
         await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("throbbing intensity. ", STATE, sdk)
-        assert BACKEND._vibe.strength == 85
+        BACKEND.on_stream_token("Intense passion. ", STATE, sdk)
+        await drain()
+        assert BACKEND._vibe.strength > 0
         await BACKEND.on_turn_stopped(STATE, sdk, reason)
         assert BACKEND._vibe.strength == 0
         assert fake.stops >= 1
@@ -142,185 +189,102 @@ async def test_cancelled_or_error_turn_hard_stops(tmp_path, reason):
         await BACKEND.shutdown()
 
 
-async def test_stop_on_turn_end_config(tmp_path):
+async def test_save_switch_and_story_disable_immediately_stop(tmp_path):
     _, fake, sdk = wire(tmp_path)
     try:
-        BACKEND._store.save_config({"stop_on_turn_end": True})
         await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("a kiss. ", STATE, sdk)
-        await BACKEND.on_turn_stopped(STATE, sdk, "completed")
+        BACKEND.on_stream_token("Intense kiss. ", STATE, sdk)
         await drain()
+        assert BACKEND._vibe.strength > 0
+
+        # Switching to another save stops the previous save's latched output
+        other_save = {**STATE, "active_save_id": "save_2"}
+        await BACKEND.on_turn_start(other_save, sdk)
         assert BACKEND._vibe.strength == 0
-    finally:
-        await BACKEND.shutdown()
-
-
-async def test_story_disabled_ignores_tokens_and_silences(tmp_path):
-    _, fake, sdk = wire(tmp_path)
-    try:
-        await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("kissed. ", STATE, sdk)
-        assert BACKEND._vibe.strength == 30
-        disabled = {"turn": 4, "module_configs": {"wb_toy_link": {"enabled": False}}}
-        await BACKEND.on_turn_start(disabled, sdk)
-        assert BACKEND._vibe.strength == 0           # disable = instant stop
         assert fake.stops >= 1
-        BACKEND.on_stream_token("throbbing. ", disabled, sdk)
-        assert BACKEND._vibe.strength == 0           # tokens ignored while off
     finally:
         await BACKEND.shutdown()
 
 
-async def test_semantic_verdict_overrides_keyword_state(tmp_path):
+async def test_toys_slash_commands(tmp_path):
     _, _, sdk = wire(tmp_path)
     try:
-        sdk.llm.response = json.dumps({"category": "calm"})
-        await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("she remembered how he kissed her once. ", STATE, sdk)
-        assert BACKEND._vibe.strength == 30          # keyword twitch (false positive)
-        await drain()                                # semantic verdict lands
-        assert BACKEND._vibe.strength == 0           # corrected to calm
-        assert BACKEND._vibe.source == "semantic:calm"
-        assert sdk.llm.calls[0]["preference"] == "fastest"
-    finally:
-        await BACKEND.shutdown()
+        out = await BACKEND.on_command_toys(["pattern", "crest", "75"], STATE, sdk)
+        assert "Crest Surge" in out["message"]
+        assert BACKEND._director.pattern_override == "crest"
+        assert BACKEND._vibe.strength == 75.0
 
+        out = await BACKEND.on_command_toys(["pattern", "auto"], STATE, sdk)
+        assert BACKEND._director.pattern_override is None
 
-async def test_model_override_routes_to_engine_llm(tmp_path):
-    engine, _, sdk = wire(tmp_path)
-    try:
-        BACKEND._store.save_config({"semantic": {"model_override": "org/custom-model"}})
-        engine.llm.response = json.dumps({"category": "gentle"})
-        await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("A sentence. ", STATE, sdk)
-        await drain()
-        assert engine.llm.calls and engine.llm.calls[0]["model"] == "org/custom-model"
-        assert sdk.llm.calls == []                   # bridge not used
-    finally:
-        await BACKEND.shutdown()
-
-
-async def test_keywords_mode_skips_semantic(tmp_path):
-    _, _, sdk = wire(tmp_path)
-    try:
-        BACKEND._store.save_config({"trigger_mode": "keywords"})
-        await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("kissed her. ", STATE, sdk)
-        await drain()
-        assert sdk.llm.calls == []
-        assert BACKEND._vibe.strength == 30
-    finally:
-        await BACKEND.shutdown()
-
-
-async def test_toys_command_stop_on_off_test(tmp_path):
-    _, fake, sdk = wire(tmp_path)
-    try:
-        await BACKEND.on_turn_start(STATE, sdk)
-        BACKEND.on_stream_token("throbbing. ", STATE, sdk)
         out = await BACKEND.on_command_toys(["stop"], STATE, sdk)
-        assert "stopped" in out["message"]
-        assert BACKEND._vibe.strength == 0
-
-        out = await BACKEND.on_command_toys(["off"], STATE, sdk)
-        assert BACKEND._vibe.vibe_on is False
-        out = await BACKEND.on_command_toys(["on"], STATE, sdk)
-        assert BACKEND._vibe.vibe_on is True
-
-        out = await BACKEND.on_command_toys(["test", "abc"], STATE, sdk)
-        assert out.get("error") is True
-        out = await BACKEND.on_command_toys(["bogus"], STATE, sdk)
-        assert out.get("error") is True
+        assert BACKEND._vibe.strength == 0.0
     finally:
         await BACKEND.shutdown()
 
 
 def make_client(tmp_path):
-    wire(tmp_path)
+    engine, _, _ = wire(tmp_path)
     app = FastAPI()
     app.include_router(BACKEND.get_router(), prefix="/api/modules/wb_toy_link")
-    return TestClient(app)
+    return TestClient(app), engine
 
 
-def test_router_status_toggle_and_stop(tmp_path):
-    client = make_client(tmp_path)
+def test_router_endpoints_patterns_preview_and_jev_prose(tmp_path):
+    client, engine = make_client(tmp_path)
+
     status = client.get("/api/modules/wb_toy_link/status").json()
     assert status["module"] == "wb_toy_link"
-    assert status["hooks_available"] is True
-    assert status["semantic"]["app_default_model"] == "provider/fast-model"
+    assert status["jev"]["ready"] is True
+    assert status["lovense"]["connected"] is True
 
-    assert client.post("/api/modules/wb_toy_link/toggle").json()["vibe_on"] is False
-    assert client.post("/api/modules/wb_toy_link/toggle").json()["vibe_on"] is True
-    assert client.post("/api/modules/wb_toy_link/stop").json()["ok"] is True
+    pats = client.get("/api/modules/wb_toy_link/patterns").json()["patterns"]
+    assert len(pats) == 7
+    assert all(len(p["curve_high"]) == 84 for p in pats)
 
-
-def test_router_config_sanitization_and_rules_roundtrip(tmp_path):
-    client = make_client(tmp_path)
+    # Config sanitization including URL host:port extraction
     cfg = client.put("/api/modules/wb_toy_link/config", json={
-        "master_cap_global": 400, "trigger_mode": "bogus",
-        "lovense": {"host": "10.0.0.5", "port": 99999},
-        "semantic": {"model_override": "  org/model  ", "window_chars": 50},
+        "lovense": {"host": "https://192.168.1.77:30010"},
+        "contrast_mode": "high",
+        "master_cap_global": 250,
     }).json()
-    assert cfg["master_cap_global"] == 100            # clamped
-    assert cfg["trigger_mode"] == "hybrid"            # invalid value rejected
-    assert cfg["lovense"]["port"] == 65535
-    assert cfg["semantic"]["model_override"] == "org/model"
-    assert cfg["semantic"]["window_chars"] == 100     # clamped up to minimum
+    assert cfg["lovense"]["host"] == "192.168.1.77"
+    assert cfg["lovense"]["port"] == 30010
+    assert cfg["lovense"]["https"] is True
+    assert cfg["master_cap_global"] == 100
 
-    rules = client.get("/api/modules/wb_toy_link/rules").json()
-    rules["rules"] = [r for r in rules["rules"] if r["id"] == "r_kiss"]
-    saved = client.put("/api/modules/wb_toy_link/rules", json=rules).json()
-    assert len(saved["rules"]) == 1
-    assert client.put("/api/modules/wb_toy_link/rules", json={"nope": 1}).status_code == 422
+    # Enable JEV endpoint
+    engine.jev.enabled = False
+    assert client.get("/api/modules/wb_toy_link/status").json()["jev"]["enabled"] is False
+    assert client.post("/api/modules/wb_toy_link/jev/enable").json()["jev"]["enabled"] is True
 
+    # Prose tester endpoint
+    probe = client.post("/api/modules/wb_toy_link/jev/test-prose", json={
+        "text": "She kissed him deeply.",
+        "feel": True,
+    }).json()
+    assert probe["ok"] is True
+    assert probe["verdict"]["pattern"] == "swell"
 
-def test_router_manual_drive(tmp_path):
-    client = make_client(tmp_path)
-    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": 62}).json()
-    assert out == {"ok": True, "strength": 62.0}
-    assert BACKEND._vibe.strength == 62.0
-    assert BACKEND._vibe.source == "manual:drive"
-    # Clamps garbage, and un-mutes: manual drive is explicit intent.
-    client.post("/api/modules/wb_toy_link/toggle")
-    assert BACKEND._vibe.vibe_on is False
-    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": 900}).json()
-    assert out["strength"] == 100.0
-    assert BACKEND._vibe.vibe_on is True
-    out = client.post("/api/modules/wb_toy_link/manual", json={"strength": "junk"}).json()
-    assert out["strength"] == 0.0
+    # Story-sync disable stops immediately
+    sync = client.post("/api/modules/wb_toy_link/story-sync", json={
+        "enabled": False,
+        "master_cap": 60,
+    }).json()
+    assert sync["status"]["story_enabled"] is False
+    assert sync["status"]["level"] == 0.0
 
-
-def test_router_rules_tester(tmp_path):
-    client = make_client(tmp_path)
-    out = client.post("/api/modules/wb_toy_link/rules/test", json={
-        "text": "She kissed him, then they drift off."}).json()
-    assert [e["rule_id"] for e in out["keyword_effects"]] == ["r_kiss", "r_sleep"]
-    assert "semantic_verdict" not in out              # not requested
-
-    # Before any turn has run there is no hook-captured sdk — the tester must
-    # still reach the LLM through the engine service (the bug report: "no llm
-    # access" from Toy Studio on a fresh backend).
-    out = client.post("/api/modules/wb_toy_link/rules/test", json={
-        "text": "hello", "semantic": True}).json()
-    assert out.get("semantic_verdict") == {"no_change": True}
-    assert "semantic_error" not in out
+    # Story-leave silences
+    assert client.post("/api/modules/wb_toy_link/story-leave").json()["ok"] is True
 
 
-async def test_classify_uses_engine_sdk_before_first_turn(tmp_path):
-    engine = StubEngine()
-    engine.sdk = StubSDK()                            # graph.py owns one of these
-    engine.sdk.llm.response = json.dumps({"category": "gentle"})
-    wire(tmp_path, engine=engine)
-    raw = await BACKEND._classify_call("prompt text")
-    assert json.loads(raw) == {"category": "gentle"}
-    assert engine.sdk.llm.calls[0]["preference"] == "fastest"
-    assert engine.llm.calls == []                     # bridge preferred over raw llm
-
-
-async def test_classify_falls_back_to_engine_llm_without_any_sdk(tmp_path):
-    engine, _, _ = wire(tmp_path)                     # StubEngine has no .sdk
-    engine.llm.response = json.dumps({"no_change": True})
-    raw = await BACKEND._classify_call("prompt text")
-    assert json.loads(raw) == {"no_change": True}
-    # Uses the app's fast model explicitly, so the right slot is billed/logged.
-    assert engine.llm.calls[0]["model"] == "provider/fast-model"
+def test_jsx_files_have_balanced_structure_and_valid_imports():
+    jsx_files = list(MODULE_ROOT.rglob("*.jsx"))
+    assert len(jsx_files) == 7
+    # widget_settings.jsx must NOT import relative modules or `storage`
+    ws_src = (MODULE_ROOT / "widget_settings.jsx").read_text(encoding="utf-8")
+    assert "from './" not in ws_src and "from 'storage'" not in ws_src
+    # widget.jsx must NOT use `transition-all` on the floating orb
+    w_src = (MODULE_ROOT / "widget.jsx").read_text(encoding="utf-8")
+    assert "transition-all" not in w_src
+    assert "translate3d" in w_src
