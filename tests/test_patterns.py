@@ -237,4 +237,71 @@ def test_shaped_sentence_phrase_entry_ramp_and_arcs():
     assert sum(ease_lv[:8]) / 8 > sum(ease_lv[25:35]) / 10
 
 
+def test_custom_block_pattern_wave_x2_then_saw_x2_harmonic_and_gapless():
+    from toylink.lovense_client import _percent_to_lovense
+    from toylink.patterns import build_lovense_phrase, eval_block_pattern, sanitize_block_pattern
+
+    spec = sanitize_block_pattern({
+        "id": "wave_saw_combo",
+        "label": "Wave x2 + Saw x2",
+        "loop_seconds": 6.0,
+        "lift_high_floor": False,
+        "vibe_tags": ["rhythmic", "building"],
+        "blocks": [
+            {"type": "wave", "width": 1.0, "repeat": 2, "peak": 1.0, "floor": 0.0, "skew": 0.5, "bend": 0.0},
+            {"type": "saw_up", "width": 1.0, "repeat": 2, "peak": 1.0, "floor": 0.0, "skew": 0.5, "bend": 0.0},
+        ],
+    })
+
+    # Continuous curve connects seamlessly at 0.0, 0.25, 0.50, 0.75
+    assert eval_block_pattern(spec, 0.0) == 0.0
+    assert abs(eval_block_pattern(spec, 0.125) - 1.0) < 1e-4
+    assert abs(eval_block_pattern(spec, 0.25) - 0.0) < 1e-4
+    assert abs(eval_block_pattern(spec, 0.375) - 1.0) < 1e-4
+    assert abs(eval_block_pattern(spec, 0.50) - 0.0) < 1e-4
+
+    levels, interval_ms, is_loop = build_lovense_phrase(
+        "wave_saw_combo",
+        intensity_norm=1.0,
+        pattern_def=spec,
+    )
+    steps = [_percent_to_lovense(x) for x in levels]
+
+    # 4 sub-cycles -> 48 harmonic steps (exact 12 steps per beat), 125 ms -> 6.00 s loop
+    assert is_loop is True
+    assert len(steps) == 48
+    assert interval_ms == 125
+
+    wave1, wave2, saw1, saw2 = steps[0:12], steps[12:24], steps[24:36], steps[36:48]
+    # Both waves match identically and peak at 20 with single-step 0 valley
+    assert wave1 == wave2
+    assert wave1[0] == 0 and max(wave1) == 20
+    # Both sawtooth climbs match identically, climb monotonically 0 -> 20, and drop crisply to 0
+    assert saw1 == saw2
+    assert saw1[0] == 0 and saw1[-1] == 20
+    assert all(saw1[i] <= saw1[i + 1] for i in range(len(saw1) - 1))
+
+
+def test_stitched_line_blocks_connect_edge_to_edge_around_loop():
+    from toylink.patterns import eval_block_pattern, sanitize_block_pattern
+
+    # 3 connected lines: 0.2 -> 0.6 -> 1.0 -> 0.2 (wraps last peak 0.2 into block 0's start!)
+    spec = sanitize_block_pattern({
+        "id": "triangle_climb",
+        "label": "Connected Climb",
+        "blocks": [
+            {"type": "line", "width": 1.0, "repeat": 1, "peak": 0.6, "bend": 0.0},
+            {"type": "line", "width": 1.0, "repeat": 1, "peak": 1.0, "bend": 0.0},
+            {"type": "line", "width": 1.0, "repeat": 1, "peak": 0.2, "bend": 0.0},
+        ],
+    })
+    assert abs(eval_block_pattern(spec, 0.0) - 0.2) < 1e-4
+    assert abs(eval_block_pattern(spec, 1 / 3 - 1e-5) - 0.6) < 1e-3
+    assert abs(eval_block_pattern(spec, 1 / 3 + 1e-5) - 0.6) < 1e-3
+    assert abs(eval_block_pattern(spec, 2 / 3 - 1e-5) - 1.0) < 1e-3
+    assert abs(eval_block_pattern(spec, 2 / 3 + 1e-5) - 1.0) < 1e-3
+    assert abs(eval_block_pattern(spec, 0.9999) - 0.2) < 1e-3
+
+
+
 

@@ -360,6 +360,9 @@ export default function ToyLinkWidget({ state, config, slotName }) {
   const jev = status.jev || {};
   const toys = lov.devices || [];
   const patternOverride = jev.pattern_override || 'auto';
+  const patternOptions = Array.isArray(status.available_patterns) && status.available_patterns.length > 0
+    ? [{ id: 'auto', label: 'Auto (JEV)' }, ...status.available_patterns]
+    : PATTERN_LIST;
   const stageActive = !!jev.reader_mode_active;
   const stageSynced = !!jev.reader_synced;
 
@@ -515,7 +518,7 @@ export default function ToyLinkWidget({ state, config, slotName }) {
           onChange={(e) => post('/pattern-override', { pattern: e.target.value })}
           className="flex-1 min-w-0 px-2 py-1 rounded bg-gray-800 border border-gray-700 text-[11px] text-gray-200 focus:border-purple-500 focus:outline-none"
         >
-          {PATTERN_LIST.map((p) => (
+          {patternOptions.map((p) => (
             <option key={p.id} value={p.id}>
               {p.label}
             </option>

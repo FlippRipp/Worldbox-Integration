@@ -18,7 +18,14 @@ import asyncio
 import re
 import time
 
-from .patterns import PATTERNS, SENTENCE_ARCS, normalize_arc, normalize_pattern
+from .patterns import (
+    PATTERNS,
+    SENTENCE_ARCS,
+    VIBE_TAG_CRITERIA,
+    all_pattern_specs,
+    normalize_arc,
+    normalize_pattern,
+)
 
 MODULE_ID = "wb_toy_link"
 
@@ -246,8 +253,30 @@ PATTERN_CRITERIA: dict[str, str] = {
 }
 
 
+def pattern_criteria_map(user_patterns: dict | None = None) -> dict[str, str]:
+    """Return JEV selection criteria for all built-in + custom/overridden patterns."""
+    specs = all_pattern_specs(user_patterns)
+    out = dict(PATTERN_CRITERIA)
+    for pat_id, spec in specs.items():
+        if pat_id in PATTERN_CRITERIA and not spec.get("is_customized"):
+            continue
+        tags = spec.get("vibe_tags") or []
+        tag_phrases = [VIBE_TAG_CRITERIA[t] for t in tags if t in VIBE_TAG_CRITERIA]
+        tagline = str(spec.get("tagline") or "").strip().rstrip(".")
+        label = str(spec.get("label") or pat_id).strip()
+        if tag_phrases:
+            base = "; ".join(tag_phrases)
+            out[pat_id] = f"{label}: {base}" + (f" ({tagline})." if tagline else ".")
+        elif tagline:
+            out[pat_id] = f"{label}: {tagline}."
+        elif pat_id not in out:
+            out[pat_id] = f"{label}: Custom sensual rhythm."
+    return out
+
+
 def build_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) -> dict:
-    allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA]
+    crit_map = pattern_criteria_map()
+    allowed = [p for p in enabled_patterns if p in crit_map]
     if not allowed:
         allowed = list(PATTERNS)
 
@@ -284,14 +313,15 @@ def build_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) ->
         questions["pattern"] = {
             "type": "choice",
             "instructions": "Choose the haptic motion pattern that best matches the physical action right now.",
-            "criteria": {p: PATTERN_CRITERIA[p] for p in allowed},
+            "criteria": {p: crit_map[p] for p in allowed},
         }
     return questions
 
 
 def build_sentence_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) -> dict:
     """Questions scoped to ``current_sentence`` with full active-state continuity."""
-    allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA] or list(PATTERNS)
+    crit_map = pattern_criteria_map()
+    allowed = [p for p in enabled_patterns if p in crit_map] or list(PATTERNS)
     questions: dict = {
         "engaged": {
             "type": "noul",
@@ -335,7 +365,7 @@ def build_sentence_questions(enabled_patterns: list[str] | tuple[str, ...] = PAT
         questions["pattern"] = {
             "type": "choice",
             "instructions": "Choose the haptic motion pattern that best matches current_sentence.",
-            "criteria": {p: PATTERN_CRITERIA[p] for p in allowed},
+            "criteria": {p: crit_map[p] for p in allowed},
         }
     return questions
 
@@ -363,7 +393,8 @@ def interpret_answers(
     low_engagement_streak: int = 0,
 ) -> dict:
     """Pure decision interpreter -> ``{action, strength, pattern, pace, ...}``."""
-    allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA] or list(PATTERNS)
+    crit_map = pattern_criteria_map()
+    allowed = [p for p in enabled_patterns if p in crit_map] or list(PATTERNS)
 
     engaged_ans = answers.get("engaged") or {}
     wind_ans = answers.get("wind_down") or {}
@@ -546,8 +577,10 @@ class JevDirector:
         return (self._get_config() or {}).get("jev", {}) or {}
 
     def _enabled_patterns(self) -> list[str]:
-        pats = (self._get_config() or {}).get("enabled_patterns") or list(PATTERNS)
-        return [p for p in pats if p in PATTERNS] or list(PATTERNS)
+        cfg = self._get_config() or {}
+        pats = cfg.get("enabled_patterns") or list(PATTERNS)
+        known = set(all_pattern_specs(cfg.get("user_patterns")).keys())
+        return [p for p in pats if p in known] or list(PATTERNS)
 
     def set_reader_mode(self, active: bool) -> None:
         was_synced = self.is_reader_synced()

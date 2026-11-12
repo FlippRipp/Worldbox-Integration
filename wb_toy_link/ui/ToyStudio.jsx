@@ -166,6 +166,11 @@ export default function ToyStudio({ onBack }) {
           status={status}
           api={API}
           refresh={refreshStatus}
+          onPatternsUpdated={(data) => {
+            if (data?.patterns) setPatterns(data.patterns);
+            if (data?.config) setConfig(data.config);
+            if (data?.status) setStatus(data.status);
+          }}
         />
       </div>
     </div>

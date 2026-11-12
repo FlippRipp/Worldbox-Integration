@@ -57,8 +57,12 @@ from toylink.patterns import (
     PATTERNS,
     PATTERN_SPECS,
     VibeState,
+    all_pattern_specs,
     normalize_pattern,
     sample_pattern_curve,
+    sanitize_block_pattern,
+    set_user_patterns_provider,
+    slugify_pattern_id,
 )
 
 MODULE_ID = "wb_toy_link"
@@ -93,6 +97,7 @@ def set_services(services: dict) -> None:
 
     base = _services.get("global_data_dir") or _services.get("data_dir") or Path(_MODULE_DIR) / "data"
     _store = ConfigStore(Path(base) / MODULE_ID)
+    set_user_patterns_provider(lambda: _store.config().get("user_patterns", {}) if _store else {})
     _vibe = VibeState()
     _lovense = LovenseClient(lambda: _store.config().get("lovense", {}))
     _manager = DeviceManager(_vibe, [_lovense], _store.config)
@@ -336,22 +341,27 @@ async def on_command_toys(args: list, state: dict, sdk) -> dict:
         except ValueError:
             return {"message": "Usage: /toys test [0-100] [pattern]", "error": True}
         pat = normalize_pattern(args[2]) if len(args) > 2 else "crest"
+        specs = all_pattern_specs()
         _manager.ensure_running()
         _manager.start_preview(strength=strength, pattern=pat, seconds=2.5)
-        return {"message": f"⚡ Testing {PATTERN_SPECS[pat]['label']} at {int(strength)}%."}
+        return {"message": f"⚡ Testing {specs.get(pat, PATTERN_SPECS['velvet'])['label']} at {int(strength)}%."}
     if sub == "pattern":
+        specs = all_pattern_specs()
+        avail_ids = list(specs.keys())
         if len(args) < 2:
             return {
-                "message": f"Available patterns: auto, {', '.join(PATTERNS)}",
+                "message": f"Available patterns: auto, {', '.join(avail_ids)}",
                 "error": True,
             }
         choice_name = args[1].lower()
         if choice_name in ("auto", "jev", "none"):
             _director.pattern_override = None
             return {"message": "🎛️ Pattern selection returned to Auto (JEV)."}
-        if choice_name not in PATTERN_SPECS:
+        if choice_name not in specs and slugify_pattern_id(choice_name) in specs:
+            choice_name = slugify_pattern_id(choice_name)
+        if choice_name not in specs:
             return {
-                "message": f"Unknown pattern {choice_name!r}. Choose: auto, {', '.join(PATTERNS)}",
+                "message": f"Unknown pattern {choice_name!r}. Choose: auto, {', '.join(avail_ids)}",
                 "error": True,
             }
         _director.pattern_override = choice_name
@@ -364,7 +374,7 @@ async def on_command_toys(args: list, state: dict, sdk) -> dict:
                 pass
         elif _vibe.strength > 0:
             _vibe.set_target(_vibe.strength, choice_name, source=f"command:{choice_name}")
-        return {"message": f"🎛️ Locked pattern to {PATTERN_SPECS[choice_name]['label']}."}
+        return {"message": f"🎛️ Locked pattern to {specs[choice_name]['label']}."}
     if sub == "status":
         s = _status()
         lov = s["lovense"]
@@ -399,6 +409,7 @@ def _status() -> dict:
     m = _manager.status()
     lov = _lovense.status()
     jev = {**_jev_host_status(), **_director.status()}
+    specs = all_pattern_specs()
     return {
         "module": MODULE_ID,
         "hooks_available": _hooks_available,
@@ -412,6 +423,15 @@ def _status() -> dict:
         "lovense": lov,
         "backends": m["backends"],
         "jev": jev,
+        "available_patterns": [
+            {
+                "id": pat_id,
+                "label": spec["label"],
+                "is_builtin": spec["is_builtin"],
+                "is_customized": spec["is_customized"],
+            }
+            for pat_id, spec in specs.items()
+        ],
     }
 
 
@@ -419,10 +439,14 @@ def _patterns_catalog() -> list[dict]:
     cfg = _store.config()
     enabled_set = set(cfg.get("enabled_patterns") or PATTERNS)
     contrast_mode = str(cfg.get("contrast_mode", "balanced"))
+    specs = all_pattern_specs(cfg.get("user_patterns"))
     items = []
-    for pat_id in PATTERNS:
-        spec = PATTERN_SPECS[pat_id]
-        win_s = 14.0 if pat_id == "swell" else 6.5
+    for pat_id, spec in specs.items():
+        if spec.get("is_customized"):
+            ls = float(spec.get("loop_seconds", 6.0))
+            win_s = ls * 2.0 if ls <= 3.6 else ls
+        else:
+            win_s = 14.0 if pat_id == "swell" else 6.5
         items.append({
             **spec,
             "enabled": pat_id in enabled_set,
@@ -491,8 +515,18 @@ def _sanitize_config(updates: dict) -> dict:
         out["sync_stage_reader"] = bool(updates["sync_stage_reader"])
     if "tick_hz" in updates:
         out["tick_hz"] = int(clamp(updates["tick_hz"], 5, 30, 20))
+    known_user_pats = dict(_store.config().get("user_patterns") or {})
+    if isinstance(updates.get("user_patterns"), dict):
+        clean_up: dict[str, dict] = {}
+        for key, val in updates["user_patterns"].items():
+            if isinstance(val, dict):
+                spec = sanitize_block_pattern(val, fallback_id=str(key))
+                clean_up[spec["id"]] = spec
+        out["user_patterns"] = clean_up
+        known_user_pats = clean_up
     if isinstance(updates.get("enabled_patterns"), list):
-        valid = [p for p in updates["enabled_patterns"] if p in PATTERNS]
+        known_ids = set(PATTERNS) | set(known_user_pats.keys())
+        valid = [p for p in updates["enabled_patterns"] if p in known_ids]
         if valid:
             out["enabled_patterns"] = valid
     if isinstance(updates.get("jev"), dict):
@@ -519,6 +553,118 @@ def get_router():
     @router.get("/patterns")
     async def patterns():
         return {"patterns": _patterns_catalog()}
+
+    @router.post("/patterns/save")
+    async def save_pattern(body: dict | None = None):
+        payload = body or {}
+        raw_pat = payload.get("pattern")
+        if not isinstance(raw_pat, dict):
+            raise HTTPException(422, "Provide a pattern object.")
+
+        cfg = _store.config()
+        up = dict(cfg.get("user_patterns") or {})
+        enabled_list = list(cfg.get("enabled_patterns") or PATTERNS)
+        create_new = bool(payload.get("create_new"))
+        prev_id = str(payload.get("previous_id") or "").strip().lower()
+
+        draft = dict(raw_pat)
+        if create_new:
+            base_slug = slugify_pattern_id(str(draft.get("label") or "custom"))
+            cand = base_slug if base_slug not in PATTERNS else f"{base_slug}_custom"
+            suffix = 2
+            while cand in PATTERNS or cand in up:
+                cand = f"{base_slug}_{suffix}"[:32]
+                suffix += 1
+            draft["id"] = cand
+        elif not draft.get("id"):
+            base_slug = slugify_pattern_id(str(draft.get("label") or "custom"))
+            cand = base_slug if base_slug not in PATTERNS else f"{base_slug}_custom"
+            suffix = 2
+            while cand in PATTERNS or (cand in up and cand != prev_id):
+                cand = f"{base_slug}_{suffix}"[:32]
+                suffix += 1
+            draft["id"] = cand
+
+        spec = sanitize_block_pattern(draft)
+        pat_id = spec["id"]
+        is_new_custom = pat_id not in PATTERNS and pat_id not in up
+
+        if prev_id and prev_id not in PATTERNS and prev_id != pat_id and prev_id in up:
+            up.pop(prev_id, None)
+            enabled_list = [pat_id if p == prev_id else p for p in enabled_list]
+            if _director.pattern_override == prev_id:
+                _director.pattern_override = pat_id
+
+        up[pat_id] = spec
+        if is_new_custom and pat_id not in enabled_list:
+            enabled_list.append(pat_id)
+
+        saved_cfg = _store.save_config({"user_patterns": up, "enabled_patterns": enabled_list})
+        _manager.notify_pattern_updated(pat_id)
+        if _vibe.pattern == pat_id and _vibe.strength > 0:
+            _vibe.set_target(_vibe.strength, pat_id, _vibe.params, source=_vibe.source or f"edit:{pat_id}")
+        merged_spec = all_pattern_specs(saved_cfg.get("user_patterns")).get(pat_id, spec)
+        return {
+            "ok": True,
+            "pattern": merged_spec,
+            "patterns": _patterns_catalog(),
+            "config": saved_cfg,
+            "status": _status(),
+        }
+
+    @router.post("/patterns/delete")
+    async def delete_pattern(body: dict | None = None):
+        pat_id = str((body or {}).get("id") or "").strip().lower()
+        if not pat_id:
+            raise HTTPException(422, "Provide pattern id.")
+        cfg = _store.config()
+        up = dict(cfg.get("user_patterns") or {})
+        enabled_list = list(cfg.get("enabled_patterns") or PATTERNS)
+        up.pop(pat_id, None)
+        if pat_id not in PATTERNS:
+            enabled_list = [p for p in enabled_list if p != pat_id]
+            if _director.pattern_override == pat_id:
+                _director.pattern_override = None
+            if _vibe.pattern == pat_id:
+                if _vibe.strength > 0:
+                    _vibe.set_target(_vibe.strength, "velvet", source="reset:velvet")
+                else:
+                    _vibe.pattern = "velvet"
+
+        saved_cfg = _store.save_config({"user_patterns": up, "enabled_patterns": enabled_list or list(PATTERNS)})
+        _manager.notify_pattern_updated(pat_id)
+        return {
+            "ok": True,
+            "patterns": _patterns_catalog(),
+            "config": saved_cfg,
+            "status": _status(),
+        }
+
+    @router.post("/patterns/preview-draft")
+    async def preview_draft(body: dict | None = None):
+        payload = body or {}
+        raw_pat = payload.get("pattern")
+        if not isinstance(raw_pat, dict):
+            raise HTTPException(422, "Provide a pattern object.")
+        spec = sanitize_block_pattern(raw_pat)
+        try:
+            strength = float(payload.get("strength", 68))
+        except (TypeError, ValueError):
+            strength = 68.0
+        try:
+            seconds = float(payload.get("seconds", 0.0))
+        except (TypeError, ValueError):
+            seconds = 0.0
+        _vibe.set_gate(True)
+        _manager.ensure_running()
+        _manager.start_preview(
+            strength=strength,
+            pattern=spec["id"],
+            seconds=seconds,
+            pace=spec["default_pace"],
+            pattern_def=spec,
+        )
+        return {"ok": True, "status": _status()}
 
     @router.post("/stop")
     async def stop():

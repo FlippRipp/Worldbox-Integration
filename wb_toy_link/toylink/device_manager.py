@@ -20,6 +20,7 @@ import time
 from .patterns import (
     PATTERN_SPECS,
     VibeState,
+    all_pattern_specs,
     build_lovense_phrase,
     normalize_arc,
     normalize_pattern,
@@ -80,6 +81,7 @@ class DeviceManager:
         self._preview_seconds: float = 0.0
         self._preview_until: float = 0.0
         self._preview_vibe: VibeState | None = None
+        self._preview_pattern_def: dict | None = None
         self._preview_envelope: float = 0.0
 
     # ------------------------------------------------------------------ loop
@@ -156,6 +158,7 @@ class DeviceManager:
         else:
             if self._preview_vibe is not None:
                 self._preview_vibe = None
+                self._preview_pattern_def = None
                 self._preview_loop = False
                 self._preview_envelope = 0.0
 
@@ -236,6 +239,7 @@ class DeviceManager:
                     pace=pv.pace,
                     contrast_mode=contrast_mode,
                     loop=True,
+                    pattern_def=self._preview_pattern_def,
                 )
                 active_s = None
             else:
@@ -441,24 +445,32 @@ class DeviceManager:
 
     # --------------------------------------------------------------- controls
 
+    def notify_pattern_updated(self, pattern_id: str | None = None) -> None:
+        """Force Lovense stream refresh if the edited pattern is actively playing."""
+        if pattern_id is None or self._sent_pattern == pattern_id or self.vibe.pattern == pattern_id:
+            self._sent_mode_key = None
+            self._last_pattern_send_at = -999.0
+
     def start_preview(
         self,
         strength: float = 55.0,
         pattern: str = "velvet",
         seconds: float = 0.0,
         pace: float | None = None,
+        pattern_def: dict | None = None,
     ) -> None:
         """Start a pattern preview. ``seconds <= 0`` loops indefinitely until stopped."""
-        pat = normalize_pattern(pattern)
         pv = VibeState(clock=self._clock)
         pv.set_target(
             max(5.0, min(100.0, float(strength))),
-            pat,
-            source=f"preview:{pat}",
-            pace=PATTERN_SPECS[pat]["default_pace"] if pace is None else pace,
+            pattern,
+            source=f"preview:{pattern}",
+            pace=pace,
+            pattern_def=pattern_def,
         )
         self._preview_id += 1
         self._preview_vibe = pv
+        self._preview_pattern_def = pv._pattern_def
         self._preview_envelope = min(self.envelope, pv.strength)
         sec = float(seconds or 0.0)
         if sec <= 0.0:
@@ -478,6 +490,7 @@ class DeviceManager:
     async def instant_stop(self) -> None:
         """Hard stop: cancel any preview, clear latch, zero output immediately."""
         self._preview_vibe = None
+        self._preview_pattern_def = None
         self._preview_loop = False
         self._preview_seconds = 0.0
         self._preview_until = 0.0
@@ -493,6 +506,7 @@ class DeviceManager:
         self.vibe.set_gate(on)
         if not on:
             self._preview_vibe = None
+            self._preview_pattern_def = None
             self._preview_loop = False
             self._preview_until = 0.0
             self.envelope = 0.0

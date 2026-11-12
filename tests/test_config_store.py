@@ -46,3 +46,31 @@ def test_legacy_stop_on_turn_end_migrates_to_between_blocks(tmp_path):
     assert updated["between_blocks"] == "low"
     assert updated["stop_on_turn_end"] is False
 
+
+def test_user_patterns_save_enable_and_delete_roundtrip(tmp_path):
+    store = ConfigStore(tmp_path)
+    saved = store.save_config({
+        "user_patterns": {
+            "double_wave": {
+                "id": "double_wave",
+                "label": "Double Wave",
+                "loop_seconds": 5.5,
+                "vibe_tags": ["sensual", "building"],
+                "blocks": [
+                    {"type": "wave", "repeat": 2, "peak": 0.95, "floor": 0.0},
+                    {"type": "saw_up", "repeat": 2, "peak": 1.0, "floor": 0.0},
+                ],
+            }
+        },
+        "enabled_patterns": ["velvet", "double_wave"],
+    })
+    assert "double_wave" in saved["user_patterns"]
+    assert saved["enabled_patterns"] == ["velvet", "double_wave"]
+
+    # Deleting from user_patterns removes key cleanly without deep-merge resurrection
+    cleared = store.save_config({"user_patterns": {}})
+    assert cleared["user_patterns"] == {}
+    assert cleared["enabled_patterns"] == ["velvet"]
+    assert ConfigStore(tmp_path).config()["user_patterns"] == {}
+
+

@@ -324,9 +324,84 @@ def test_reader_sync_endpoint_and_low_intensity_between_blocks(tmp_path):
 
 
 
+def test_custom_and_edited_builtin_patterns_endpoints_and_jev_criteria(tmp_path):
+    client, engine = make_client(tmp_path)
+
+    # 1. Create a brand-new custom pattern (Wave x2 -> Saw x2)
+    save_res = client.post("/api/modules/wb_toy_link/patterns/save", json={
+        "create_new": True,
+        "pattern": {
+            "label": "Double Wave & Saw",
+            "tagline": "Two smooth arches into two crisp sawtooth climbs.",
+            "loop_seconds": 6.0,
+            "lift_high_floor": False,
+            "vibe_tags": ["rhythmic", "building"],
+            "blocks": [
+                {"type": "wave", "width": 1.0, "repeat": 2, "peak": 0.9, "floor": 0.0},
+                {"type": "saw_up", "width": 1.0, "repeat": 2, "peak": 1.0, "floor": 0.0},
+            ],
+        },
+    }).json()
+    assert save_res["ok"] is True
+    custom_id = save_res["pattern"]["id"]
+    assert custom_id == "double_wave_saw"
+    assert save_res["pattern"]["is_builtin"] is False
+    assert custom_id in save_res["config"]["enabled_patterns"]
+    assert any(p["id"] == custom_id for p in save_res["status"]["available_patterns"])
+
+    # JEV prose probe automatically includes the new custom pattern's vibe criteria!
+    engine.jev.answers = make_answers(pattern=custom_id)
+    probe = client.post("/api/modules/wb_toy_link/jev/test-prose", json={
+        "text": "She rocked into a steady building rhythm against him.",
+    }).json()
+    assert probe["ok"] is True
+    assert custom_id in engine.jev.calls[-1]["questions"]["pattern"]["criteria"]
+    assert probe["verdict"]["pattern"] == custom_id
+
+    # /toys pattern <custom_id> locks onto the custom pattern cleanly
+    cmd_res = asyncio.run(BACKEND.on_command_toys(["pattern", custom_id], {}, engine.sdk))
+    assert "Double Wave & Saw" in cmd_res["message"]
+
+    # 2. Edit a built-in pattern ("velvet") and then reset it back to factory default
+    edit_builtin = client.post("/api/modules/wb_toy_link/patterns/save", json={
+        "create_new": False,
+        "previous_id": "velvet",
+        "pattern": {
+            "id": "velvet",
+            "label": "Velvet",
+            "loop_seconds": 4.5,
+            "vibe_tags": ["gentle"],
+            "blocks": [{"type": "wave", "repeat": 1, "peak": 0.85, "floor": 0.25}],
+        },
+    }).json()
+    assert edit_builtin["pattern"]["is_builtin"] is True
+    assert edit_builtin["pattern"]["is_customized"] is True
+
+    reset_builtin = client.post("/api/modules/wb_toy_link/patterns/delete", json={"id": "velvet"}).json()
+    velvet_entry = next(p for p in reset_builtin["patterns"] if p["id"] == "velvet")
+    assert velvet_entry["is_customized"] is False
+
+    # 3. Live draft preview streams unsaved curves without error
+    draft_prev = client.post("/api/modules/wb_toy_link/patterns/preview-draft", json={
+        "strength": 70,
+        "pattern": {
+            "label": "Draft Saw",
+            "loop_seconds": 4.0,
+            "blocks": [{"type": "saw_down", "repeat": 3, "peak": 1.0, "floor": 0.0}],
+        },
+    }).json()
+    assert draft_prev["ok"] is True
+    assert draft_prev["status"]["preview"]["looping"] is True
+
+    # 4. Deleting custom pattern cleans up enabled_patterns & overrides
+    del_custom = client.post("/api/modules/wb_toy_link/patterns/delete", json={"id": custom_id}).json()
+    assert custom_id not in del_custom["config"]["enabled_patterns"]
+    assert all(p["id"] != custom_id for p in del_custom["patterns"])
+
+
 def test_jsx_files_have_balanced_structure_and_valid_imports():
     jsx_files = list(MODULE_ROOT.rglob("*.jsx"))
-    assert len(jsx_files) == 7
+    assert len(jsx_files) == 8
     # widget_settings.jsx must NOT import relative modules or `storage`
     ws_src = (MODULE_ROOT / "widget_settings.jsx").read_text(encoding="utf-8")
     assert "from './" not in ws_src and "from 'storage'" not in ws_src
