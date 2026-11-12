@@ -288,3 +288,23 @@ def test_jsx_files_have_balanced_structure_and_valid_imports():
     w_src = (MODULE_ROOT / "widget.jsx").read_text(encoding="utf-8")
     assert "transition-all" not in w_src
     assert "translate3d" in w_src
+
+
+def test_hot_reload_evicts_stale_v01_toylink_submodules():
+    """Simulates Worldbox's Module Manager hot-updating from v0.1.0 where old
+    `toylink` / `toylink.patterns` (lacking `normalize_pattern`) are cached in
+    `sys.modules`."""
+    import sys
+    import types
+
+    stale_pkg = types.ModuleType("toylink")
+    stale_patterns = types.ModuleType("toylink.patterns")
+    stale_patterns.PATTERNS = ("constant", "pulse", "wave", "escalate")
+    sys.modules["toylink"] = stale_pkg
+    sys.modules["toylink.patterns"] = stale_patterns
+
+    reloaded = load_backend()
+    assert callable(reloaded.normalize_pattern)
+    assert reloaded.normalize_pattern("wave") == "swell"
+    assert sys.modules["toylink.patterns"] is not stale_patterns
+

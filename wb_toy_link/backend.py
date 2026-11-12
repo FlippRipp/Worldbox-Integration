@@ -11,12 +11,42 @@ the procedural pattern engine, and ``LovenseClient``:
 from __future__ import annotations
 
 import asyncio
+import importlib
+import os
 import sys
 from pathlib import Path
 
 _MODULE_DIR = str(Path(__file__).resolve().parent)
-if _MODULE_DIR not in sys.path:
-    sys.path.insert(0, _MODULE_DIR)
+
+
+def _prepare_hot_reload(module_dir: str) -> None:
+    """Purge stale ``toylink.*`` submodules and orphaned loops on hot-update."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        for task in list(asyncio.all_tasks(loop)):
+            coro = task.get_coro()
+            code = getattr(coro, "cr_code", None)
+            fname = (getattr(code, "co_filename", "") or "").replace("\\", "/").lower()
+            if "/toylink/device_manager.py" in fname and getattr(code, "co_name", "") == "_loop":
+                task.cancel()
+
+    norm_target = os.path.normcase(os.path.abspath(module_dir))
+    sys.path[:] = [
+        p for p in sys.path
+        if os.path.normcase(os.path.abspath(p or ".")) != norm_target
+    ]
+    sys.path.insert(0, module_dir)
+
+    for mod_name in list(sys.modules):
+        if mod_name == "toylink" or mod_name.startswith("toylink."):
+            sys.modules.pop(mod_name, None)
+    importlib.invalidate_caches()
+
+
+_prepare_hot_reload(_MODULE_DIR)
 
 from toylink.config_store import ConfigStore
 from toylink.device_manager import DeviceManager
