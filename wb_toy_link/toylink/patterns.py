@@ -34,13 +34,13 @@ PATTERN_SPECS: dict[str, dict] = {
     "swell": {
         "id": "swell",
         "label": "Ocean Swell",
-        "tagline": "Unhurried rising waves with lingering crests and evolving depth.",
+        "tagline": "Slow, deep 13s tide building gradually from 0% all the way to full crest and back down.",
         "default_pace": 0.40,
     },
     "heartbeat": {
         "id": "heartbeat",
         "label": "Heartbeat",
-        "tagline": "Organic paired lub-dub throb that quickens and eases in phrases.",
+        "tagline": "Pronounced lub-dub throb punching out of pure silence with a crisp pause between beats.",
         "default_pace": 0.45,
     },
     "tease": {
@@ -52,7 +52,7 @@ PATTERN_SPECS: dict[str, dict] = {
     "rhythm": {
         "id": "rhythm",
         "label": "Rhythm",
-        "tagline": "Fluid physical cadence with 4-beat accents and deep drive.",
+        "tagline": "Bold 0%↔100% full-depth strokes with 4-beat accents and crisp zero-floor contrast.",
         "default_pace": 0.60,
     },
     "crest": {
@@ -109,13 +109,14 @@ def _carrier_hz(pattern: str, pace: float, m1: float, hi_blend: float) -> float:
     if pattern == "velvet":
         return (0.30 + 0.38 * pace) * rubato
     if pattern == "swell":
-        return (0.20 + 0.28 * pace) * rubato
+        # Long 11.5–15s majestic tide wave (0% -> 100% -> 0%)
+        return (0.066 + 0.026 * pace) * (1.0 + 0.06 * m1)
     if pattern == "heartbeat":
-        return (0.50 + 0.42 * pace + 0.14 * hi_blend) * rubato
+        return (0.46 + 0.30 * pace + 0.08 * hi_blend) * (1.0 + 0.06 * m1)
     if pattern == "tease":
         return (0.55 + 0.55 * pace) * rubato
     if pattern == "rhythm":
-        return (0.62 + 0.72 * pace + 0.18 * hi_blend) * rubato
+        return (0.58 + 0.56 * pace + 0.10 * hi_blend) * rubato
     if pattern == "crest":
         return (1.02 + 0.40 * pace) * rubato
     if pattern == "afterglow":
@@ -168,24 +169,30 @@ def _eval_single(
         return _clamp(val)
 
     if pattern == "swell":
-        skew = 0.62 + 0.07 * m1
-        if u < skew:
-            s = 0.5 - 0.5 * math.cos(math.pi * (u / skew))
+        # Long gradual tide: brief 0% rest -> slow ~64% buildup -> full crest -> smooth ~30% glide to 0%
+        if u < 0.03 or u >= 0.97:
+            return 0.0
+        crest_u = 0.67 if periodic_lfo is not None else (0.65 + 0.04 * m1)
+        if u < crest_u:
+            r = (u - 0.03) / (crest_u - 0.03)
+            s = (0.5 - 0.5 * math.cos(math.pi * r)) ** 1.18
         else:
-            s = 0.5 + 0.5 * math.cos(math.pi * ((u - skew) / (1.0 - skew)))
-        valley = 0.24 + 0.14 * breath + 0.20 * hi_blend
-        peak = 0.88 + 0.12 * breath
-        swell_val = valley + (peak - valley) * s
-        crest_mask = s * hi_blend * 0.68
-        return _clamp(swell_val * (1.0 - crest_mask) + c_wave * crest_mask)
+            d = (u - crest_u) / (0.97 - crest_u)
+            s = (0.5 + 0.5 * math.cos(math.pi * d)) ** 1.10
+        peak = 1.0 if periodic_lfo is not None else (0.94 + 0.06 * breath)
+        return _clamp(peak * s)
 
     if pattern == "heartbeat":
-        lub = math.exp(-(((u - 0.18) / 0.120) ** 2)) * (0.84 + 0.08 * breath)
-        dub = math.exp(-(((u - 0.45) / 0.140) ** 2)) * 1.0
-        beat = max(lub, dub)
-        floor = 0.22 + 0.08 * m2 + 0.24 * hi_blend
-        hb = floor + (1.0 - floor) * beat
-        return _clamp(hb * (1.0 - 0.30 * hi_blend) + c_wave * (0.30 * hi_blend))
+        # Crisp paired LUB–DUB punching out of pure 0% silence with a clean brake pause between beats
+        if 0.035 <= u < 0.235:
+            w_lub = (u - 0.035) / 0.200
+            lub = min(1.0, 1.12 * ((0.5 - 0.5 * math.cos(TAU * w_lub)) ** 0.72)) * (0.68 + 0.08 * breath)
+            return _clamp(lub)
+        if 0.420 <= u < 0.665:
+            w_dub = (u - 0.420) / 0.245
+            dub = min(1.0, 1.12 * ((0.5 - 0.5 * math.cos(TAU * w_dub)) ** 0.68)) * (0.97 + 0.03 * breath)
+            return _clamp(dub)
+        return 0.0
 
     if pattern == "tease":
         bar = (phase % 8.0) / 8.0
@@ -206,16 +213,15 @@ def _eval_single(
         return _clamp(hushed * (1.0 - re_enter) + 0.18 * re_enter)
 
     if pattern == "rhythm":
+        # Full 0% <-> 100% high-contrast stroke with accented 4th beat and clean zero valleys
         bar_beat = int(math.floor(phase)) % 4
-        accent = 1.0 if bar_beat == 3 else (0.88 + 0.10 * breath)
-        attack_frac = 0.42 - 0.05 * pace
-        if u < attack_frac:
-            stroke = 0.5 - 0.5 * math.cos(math.pi * (u / attack_frac))
-        else:
-            rem = (u - attack_frac) / (1.0 - attack_frac)
-            stroke = 0.5 + 0.5 * math.cos(math.pi * rem)
-        floor = 0.24 + 0.26 * hi_blend + 0.05 * m2
-        return _clamp(floor + (accent - floor) * stroke)
+        accent = 1.0 if bar_beat == 3 else (0.90 + 0.06 * breath)
+        active_frac = 0.65
+        if u >= active_frac:
+            return 0.0
+        w_u = u / active_frac
+        stroke = min(1.0, 1.24 * ((0.5 - 0.5 * math.cos(TAU * w_u)) ** 0.60))
+        return _clamp(accent * stroke)
 
     if pattern == "crest":
         if periodic_lfo is not None:
@@ -242,13 +248,13 @@ def build_lovense_phrase(
     pace: float | None = None,
     contrast_mode: str = "balanced",
     loop: bool = True,
-    steps: int = 50,
+    steps: int | None = None,
 ) -> tuple[list[float], int, bool]:
-    """Synthesize a 50-step Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``.
+    """Synthesize a 48–50 step Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``.
 
     - When ``loop=True`` (all continuous patterns + Toy Studio ``Feel`` previews),
       carrier cycles, contrast cycles, and dual-harmonic phrase modulation complete
-      exact integer multiples across ``steps`` so ``steps[49] -> steps[0]`` loops
+      exact integer multiples across ``steps`` so the end wraps to ``steps[0]``
       seamlessly inside Lovense with ``timeSec: 0`` and ZERO refresh packets.
     - When ``loop=False`` and ``pattern == "afterglow"`` (story wind-down),
       synthesizes a single 9.5 s decaying cosine phrase ending on ``0;0;0;0``.
@@ -258,7 +264,8 @@ def build_lovense_phrase(
     use_pace = _clamp(spec["default_pace"] if pace is None else float(pace))
     norm_i = _clamp(float(intensity_norm), 0.0, 1.0)
     c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
-    n = max(16, min(50, int(steps)))
+    default_n = 48 if (loop and pat in ("heartbeat", "tease", "rhythm")) else 50
+    n = max(16, min(50, default_n if steps is None else int(steps)))
 
     if pat == "afterglow" and not loop:
         interval_ms = 190  # 50 * 190 ms = 9.50 s full decay in one packet
@@ -280,12 +287,14 @@ def build_lovense_phrase(
         m_cycles = 3
         k_contrast = 7 + int(round(2 * use_pace))
     elif pat == "swell":
-        interval_ms = int(round(175 - 40 * use_pace))
-        m_cycles = 2 if use_pace < 0.55 else 3
-        k_contrast = 8
+        # 50 steps * 230..300 ms = 11.5..15.0 s single gradual 0% -> 100% -> 0% tide wave
+        interval_ms = int(round(300 - 70 * use_pace))
+        m_cycles = 1
+        k_contrast = 6
     elif pat == "heartbeat":
-        interval_ms = int(round(150 - 30 * use_pace))
-        m_cycles = 5 + int(round(2 * use_pace))
+        # 4 paired LUB–DUB beats across 50 steps (~12.5 steps / ~1.7–2.0 s per heartbeat)
+        interval_ms = int(round(165 - 35 * use_pace))
+        m_cycles = 4
         k_contrast = 8
     elif pat == "tease":
         interval_ms = int(round(170 - 35 * use_pace))
@@ -315,7 +324,7 @@ def build_lovense_phrase(
             theta = TAU * frac_u
             m1 = math.sin(theta)
             m2 = math.sin(2.0 * theta + 0.7)
-            rubato = 0.0 if pat in ("tease", "rhythm") else (0.04 * m1)
+            rubato = 0.0 if pat in ("swell", "heartbeat", "tease", "rhythm") else (0.04 * m1)
             phase = m_cycles * frac_u + rubato
             c_phase = k_contrast * frac_u + 0.05 * m1
             w = _eval_single(

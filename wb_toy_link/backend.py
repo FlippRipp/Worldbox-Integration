@@ -372,14 +372,15 @@ def _patterns_catalog() -> list[dict]:
     items = []
     for pat_id in PATTERNS:
         spec = PATTERN_SPECS[pat_id]
+        win_s = 14.0 if pat_id == "swell" else 6.5
         items.append({
             **spec,
             "enabled": pat_id in enabled_set,
             "curve_moderate": sample_pattern_curve(
-                pat_id, duration_s=6.0, steps=84, intensity=58.0, contrast_mode=contrast_mode
+                pat_id, duration_s=win_s, steps=84, intensity=58.0, contrast_mode=contrast_mode
             ),
             "curve_high": sample_pattern_curve(
-                pat_id, duration_s=6.0, steps=84, intensity=92.0, contrast_mode=contrast_mode
+                pat_id, duration_s=win_s, steps=84, intensity=92.0, contrast_mode=contrast_mode
             ),
         })
     return items

@@ -73,7 +73,7 @@ def test_phase_continuity_when_strength_or_pace_updates():
     for _ in range(15):
         vs.advance_and_sample(0.05, 0.60)
     saved_phase = vs.phase
-    assert saved_phase > 0.1
+    assert saved_phase > 0.04
 
     # Updating strength and pace mid-stream MUST NOT reset oscillator phase to 0
     vs.set_target(85, "swell", pace=0.75)
@@ -129,9 +129,9 @@ def test_build_lovense_phrase_loops_seamlessly_across_wrap(pat):
         loop=True,
     )
     assert is_loop is True
-    assert len(levels) == 50
+    assert 48 <= len(levels) <= 50
     assert interval_ms >= 110
-    # Wrap seam from step 49 -> step 0 must be just as smooth as interior steps!
+    # Wrap seam from last step -> step 0 must be just as smooth as interior steps!
     max_interior = max(abs(levels[i + 1] - levels[i]) for i in range(len(levels) - 1))
     seam_jump = abs(levels[0] - levels[-1])
     assert seam_jump <= max(0.12, max_interior + 0.03)
@@ -149,4 +149,66 @@ def test_build_lovense_phrase_one_shot_afterglow_ends_on_zeros():
     assert interval_ms == 190
     assert len(levels) == 50
     assert levels[-4:] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_rhythm_full_zero_to_hundred_contrast_distinct_from_crest():
+    from toylink.lovense_client import _percent_to_lovense
+    from toylink.patterns import build_lovense_phrase
+
+    rhythm_lv, _, _ = build_lovense_phrase("rhythm", intensity_norm=1.0, pace=0.60)
+    crest_lv, _, _ = build_lovense_phrase("crest", intensity_norm=1.0, pace=0.78)
+    rhythm_steps = [_percent_to_lovense(x) for x in rhythm_lv]
+    crest_steps = [_percent_to_lovense(x) for x in crest_lv]
+
+    # Rhythm drives 0% <-> 100% every stroke (8 beats * 2 zero steps >= 16 zeros, peak == 20)
+    assert min(rhythm_steps) == 0
+    assert max(rhythm_steps) == 20
+    assert rhythm_steps.count(0) >= 16
+
+    # Crest Surge stays in High <-> Medium band (~45%-100%) without dropping to 0
+    assert min(crest_steps) >= 8
+    assert max(crest_steps) == 20
+
+
+def test_heartbeat_pronounced_lub_dub_with_zero_brake_and_silence():
+    from toylink.lovense_client import _percent_to_lovense
+    from toylink.patterns import build_lovense_phrase
+
+    hb_lv, interval_ms, _ = build_lovense_phrase("heartbeat", intensity_norm=1.0, pace=0.45)
+    steps = [_percent_to_lovense(x) for x in hb_lv]
+    assert len(steps) == 48
+    assert 130 <= interval_ms <= 165
+
+    # Inspect the first 12-step heartbeat pair: LUB (~70%) -> 0 brake -> DUB (100%) -> 0 silence
+    first_pair = steps[:12]
+    lub_peak = max(first_pair[:3])
+    inter_beat_notch = first_pair[3:5]
+    dub_peak = max(first_pair[5:8])
+    diastole = first_pair[8:12]
+
+    assert 12 <= lub_peak <= 16
+    assert inter_beat_notch == [0, 0]
+    assert dub_peak == 20
+    assert diastole == [0, 0, 0, 0]
+
+
+def test_ocean_swell_long_gradual_zero_to_full_and_down():
+    from toylink.lovense_client import _percent_to_lovense
+    from toylink.patterns import build_lovense_phrase
+
+    swell_lv, interval_ms, _ = build_lovense_phrase("swell", intensity_norm=1.0, pace=0.40)
+    steps = [_percent_to_lovense(x) for x in swell_lv]
+    total_duration_s = (len(steps) * interval_ms) / 1000.0
+
+    # Long ~13.6s wave starting at 0, building monotonically to 20, and gliding monotonically back to 0
+    assert total_duration_s >= 12.0
+    assert steps[0] == 0 and steps[-1] == 0
+    assert max(steps) == 20
+    peak_idx = steps.index(20)
+    assert peak_idx >= 28  # ~60%+ of the wave spent gradually building up
+    # Monotonic non-decreasing buildup and non-increasing glide down
+    assert all(steps[i] <= steps[i + 1] for i in range(peak_idx))
+    last_peak_idx = len(steps) - 1 - steps[::-1].index(20)
+    assert all(steps[i] >= steps[i + 1] for i in range(last_peak_idx, len(steps) - 1))
+
 

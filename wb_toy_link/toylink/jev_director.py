@@ -65,11 +65,11 @@ PACE_CRITERIA: dict[str, str] = {
 
 PATTERN_CRITERIA: dict[str, str] = {
     "velvet": "Continuous close contact, warm embrace, lingering kiss, or steady sensual pressure.",
-    "swell": "Rolling sensual waves — caressing, slow grinding, deep kissing, rising warmth.",
-    "heartbeat": "Throbbing tension, breathless anticipation, aching pulse, or intimate closeness.",
+    "swell": "Slow, deep, gradually building sensual waves — long rising arousal, slow deep kissing, lingering full-body caresses.",
+    "heartbeat": "Pronounced throbbing pulse out of stillness — breathless tension, aching anticipation, racing heartbeats.",
     "tease": "Playful teasing, edging, stop-and-go touch, building anticipation then pulling back.",
-    "rhythm": "Clear repetitive physical cadence — stroking, thrusting, rocking, or bouncing in rhythm.",
-    "crest": "Peak or near-peak overwhelming intensity — rapid high-contrast surges at climax or right on the brink.",
+    "rhythm": "Bold full-stroke physical cadence (0 to full) — deliberate thrusting, stroking, rocking, or bouncing in rhythm.",
+    "crest": "Peak or near-peak overwhelming intensity — rapid High-to-Medium surges at climax or right on the brink.",
     "afterglow": "Coming down from climax, trembling aftershocks, softening touch, resting together.",
 }
 
