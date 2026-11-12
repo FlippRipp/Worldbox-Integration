@@ -278,6 +278,52 @@ def test_router_endpoints_patterns_preview_and_jev_prose(tmp_path):
     assert client.post("/api/modules/wb_toy_link/story-leave").json()["ok"] is True
 
 
+def test_reader_sync_endpoint_and_low_intensity_between_blocks(tmp_path):
+    client, _ = make_client(tmp_path)
+
+    # Configure Between Storyteller Blocks -> "low" (20% Velvet simmer)
+    cfg = client.put("/api/modules/wb_toy_link/config", json={"between_blocks": "low"}).json()
+    assert cfg["between_blocks"] == "low"
+    assert cfg["stop_on_turn_end"] is False
+
+    # Activate Paced Stage mode
+    r_mode = client.post("/api/modules/wb_toy_link/reader-sync", json={"phase": "mode", "mode": "stage"}).json()
+    assert r_mode["reader_synced"] is True
+
+    # Reveal an active sentence on Stage -> applies JEV verdict (~53% swell from FakeEngine)
+    r_sent = client.post("/api/modules/wb_toy_link/reader-sync", json={
+        "phase": "sentence",
+        "sentence_index": 0,
+        "char_start": 0,
+        "char_end": 34,
+        "text": "She pulled him close against her.",
+    }).json()
+    assert r_sent["ok"] is True
+    assert r_sent["status"]["vibe"]["strength"] > 40.0
+
+    # Pause / Resume Stage reader gates output cleanly
+    assert client.post("/api/modules/wb_toy_link/reader-sync", json={"phase": "pause"}).json()["vibe_on"] is False
+    assert client.post("/api/modules/wb_toy_link/reader-sync", json={"phase": "resume"}).json()["vibe_on"] is True
+
+    # Reader reaches end of block -> steps down to gentle 20% Velvet simmer instead of stopping or staying high!
+    r_end = client.post("/api/modules/wb_toy_link/reader-sync", json={
+        "phase": "turn_end",
+        "reason": "completed",
+    }).json()
+    assert r_end["status"]["vibe"]["strength"] == 20.0
+    assert r_end["status"]["vibe"]["pattern"] == "velvet"
+    assert r_end["status"]["vibe"]["source"] == "between:low"
+
+    # When toy is silent (0%), between_blocks="low" MUST stay silent at 0%!
+    client.post("/api/modules/wb_toy_link/stop")
+    r_end_silent = client.post("/api/modules/wb_toy_link/reader-sync", json={
+        "phase": "turn_end",
+        "reason": "completed",
+    }).json()
+    assert r_end_silent["status"]["vibe"]["strength"] == 0.0
+
+
+
 def test_jsx_files_have_balanced_structure_and_valid_imports():
     jsx_files = list(MODULE_ROOT.rglob("*.jsx"))
     assert len(jsx_files) == 7

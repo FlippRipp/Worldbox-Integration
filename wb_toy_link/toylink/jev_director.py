@@ -23,6 +23,171 @@ from .patterns import PATTERNS, normalize_pattern
 MODULE_ID = "wb_toy_link"
 
 _BEAT_BOUNDARY = re.compile(r"[.!?;\n—][\"'”’)\]]*(\s|$)")
+_STATE_BLOCK_RE = re.compile(
+    r"<!--[\s\S]*?(?:-->|$)|^ {0,3}<(details|internal_states)\b[^>]*>[\s\S]*?(?:</\1\s*>|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_COLOR_TAG_RE = re.compile(r"</?\s*(?:color\s*:\s*)?[a-z]+(?:(?:\s*:\s*|\s+)[a-z]+)?\s*>", re.IGNORECASE)
+_COLOR_CLOSE_RE = re.compile(r"^</\s*(?:color\s*:\s*)?[a-z]+(?:(?:\s*:\s*|\s+)[a-z]+)?\s*>", re.IGNORECASE)
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "inc", "ltd",
+    "capt", "sgt", "col", "gen", "lt", "cmdr", "gov", "sen", "rep", "rev", "no",
+}
+
+
+def strip_stage_hidden_blocks(raw: str) -> str:
+    if not raw:
+        return ""
+    return _STATE_BLOCK_RE.sub("\n\n", str(raw)).replace("\r\n", "\n")
+
+
+def _visible_len(text: str) -> int:
+    if not text:
+        return 0
+    cleaned = _COLOR_TAG_RE.sub("", str(text))
+    cleaned = re.sub(r"[*_~`#>]", "", cleaned)
+    return len(cleaned.strip())
+
+
+def _ends_with_abbreviation(slice_before_dot: str) -> bool:
+    m = re.search(r"(?:^|[\s([\"“'])([A-Za-z.]{1,8})$", slice_before_dot)
+    if not m:
+        return False
+    word = m.group(1).replace(".", "").lower()
+    if not word:
+        return False
+    if len(word) == 1:
+        return True
+    return word in _ABBREVIATIONS
+
+
+def split_stage_sentences(raw_text: str, *, is_complete: bool = True) -> list[dict]:
+    """Mirror frontend ``stageSegments.js`` so pre-scored cues align 1-to-1 with Stage beats."""
+    cleaned = strip_stage_hidden_blocks(raw_text)
+    if not cleaned.strip():
+        return []
+
+    segments: list[dict] = []
+    n = len(cleaned)
+    seg_start = 0
+    while seg_start < n and cleaned[seg_start].isspace():
+        seg_start += 1
+
+    i = seg_start
+    in_straight = False
+    in_curly = False
+
+    def push_seg(end_idx: int, complete: bool) -> None:
+        s = seg_start
+        e = end_idx
+        while s < e and cleaned[s].isspace():
+            s += 1
+        while e > s and cleaned[e - 1].isspace():
+            e -= 1
+        if e <= s:
+            return
+        segments.append({
+            "index": len(segments),
+            "char_start": s,
+            "char_end": e,
+            "text": cleaned[s:e],
+            "complete": complete,
+        })
+
+    while i < n:
+        ch = cleaned[i]
+        if ch == '"':
+            in_straight = not in_straight
+        elif ch == "“":
+            in_curly = True
+        elif ch == "”":
+            in_curly = False
+
+        if ch == "\n":
+            j = i + 1
+            saw_second = False
+            while j < n and cleaned[j] in " \t\n":
+                if cleaned[j] == "\n":
+                    saw_second = True
+                j += 1
+            if saw_second:
+                push_seg(i, True)
+                in_straight = False
+                in_curly = False
+                seg_start = j
+                i = j
+                continue
+
+        if ch in ".!?…":
+            p_end = i + 1
+            while p_end < n and cleaned[p_end] in ".!?…":
+                p_end += 1
+            after = p_end
+            straight_after = in_straight
+            curly_after = in_curly
+            while after < n:
+                c_after = cleaned[after]
+                if c_after == '"':
+                    straight_after = not straight_after
+                    after += 1
+                    continue
+                if c_after == "”":
+                    curly_after = False
+                    after += 1
+                    continue
+                if c_after in "'’)]*_":
+                    after += 1
+                    continue
+                m_close = _COLOR_CLOSE_RE.match(cleaned[after:])
+                if m_close:
+                    after += len(m_close.group(0))
+                    continue
+                break
+
+            is_single_dot = ch == "." and p_end == i + 1
+            is_abbr = is_single_dot and _ends_with_abbreviation(cleaned[seg_start:i])
+            at_end = after >= n
+            followed_by_space = (not at_end) and cleaned[after].isspace()
+            still_in_quote = straight_after or curly_after
+            cand_len = _visible_len(cleaned[seg_start:after])
+
+            if (not is_abbr) and (followed_by_space or (at_end and is_complete)) and ((not still_in_quote) or cand_len >= 150):
+                next_non_space = after
+                nl_count = 0
+                while next_non_space < n and cleaned[next_non_space].isspace():
+                    if cleaned[next_non_space] == "\n":
+                        nl_count += 1
+                    next_non_space += 1
+                has_para_break = nl_count >= 2
+                if cand_len >= 14 or has_para_break or (at_end and is_complete):
+                    push_seg(after, True)
+                    in_straight = False if has_para_break else straight_after
+                    in_curly = False if has_para_break else curly_after
+                    seg_start = next_non_space
+                    i = next_non_space
+                    continue
+
+            in_straight = straight_after
+            in_curly = curly_after
+            i = max(i + 1, after)
+            continue
+
+        i += 1
+
+    if seg_start < n:
+        rem = cleaned[seg_start:]
+        if (not is_complete) and _visible_len(rem) > 240:
+            m_clause = re.match(r"^([\s\S]{140,240}?[,;—:])\s+", rem)
+            if m_clause:
+                cut = seg_start + len(m_clause.group(1))
+                push_seg(cut, True)
+                seg_start = cut
+                while seg_start < n and cleaned[seg_start].isspace():
+                    seg_start += 1
+        if seg_start < n:
+            push_seg(n, is_complete)
+
+    return segments
 
 INTENSITY_ORDER: tuple[str, ...] = (
     "none",
@@ -112,6 +277,45 @@ def build_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) ->
         questions["pattern"] = {
             "type": "choice",
             "instructions": "Choose the haptic motion pattern that best matches the physical action right now.",
+            "criteria": {p: PATTERN_CRITERIA[p] for p in allowed},
+        }
+    return questions
+
+
+def build_sentence_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) -> dict:
+    """Questions scoped specifically to ``current_sentence`` for Stage Reader sync."""
+    allowed = [p for p in enabled_patterns if p in PATTERN_CRITERIA] or list(PATTERNS)
+    questions: dict = {
+        "engaged": {
+            "type": "noul",
+            "instructions": (
+                "Is physical touch, bodily intimacy, or erotic stimulation actively "
+                "happening during current_sentence (using turn_so_far as context)? "
+                "Answer no for negations, memories, plans, or purely non-physical dialogue/description."
+            ),
+        },
+        "wind_down": {
+            "type": "noul",
+            "instructions": (
+                "Does an active physical or intimate moment wind down, pause, finish, "
+                "or settle into post-climax rest/afterglow in current_sentence?"
+            ),
+        },
+        "intensity": {
+            "type": "choice",
+            "instructions": "Choose the physical/erotic intensity during current_sentence.",
+            "criteria": dict(INTENSITY_CRITERIA),
+        },
+        "pace": {
+            "type": "choice",
+            "instructions": "Choose the physical tempo/pace during current_sentence.",
+            "criteria": dict(PACE_CRITERIA),
+        },
+    }
+    if len(allowed) >= 2:
+        questions["pattern"] = {
+            "type": "choice",
+            "instructions": "Choose the haptic motion pattern that best matches current_sentence.",
             "criteria": {p: PATTERN_CRITERIA[p] for p in allowed},
         }
     return questions
@@ -230,6 +434,7 @@ class JevDirector:
         self._clock = clock
 
         self.pattern_override: str | None = None
+        self.reader_mode_active: bool = False
         self._recent_story: list[str] = []
         self._player_action: str = ""
         self._narration: str = ""
@@ -238,6 +443,16 @@ class JevDirector:
         self._seq: int = 0
         self._inflight: asyncio.Task | None = None
         self._dirty: bool = False
+        self._on_turn_settled = None
+
+        # Sentence-by-sentence lookahead state for Paced Stage sync
+        self._queued_count: int = 0
+        self._pending_sentences: list[dict] = []
+        self._sentence_cues: dict[int, dict] = {}
+        self._sentence_worker: asyncio.Task | None = None
+        self._cue_event: asyncio.Event | None = None
+        self._simulated_strength: float = 0.0
+        self._active_reader_idx: int = -1
 
         self.calls: int = 0
         self.last_verdict: dict | None = None
@@ -250,6 +465,20 @@ class JevDirector:
         pats = (self._get_config() or {}).get("enabled_patterns") or list(PATTERNS)
         return [p for p in pats if p in PATTERNS] or list(PATTERNS)
 
+    def set_reader_mode(self, active: bool) -> None:
+        was_synced = self.is_reader_synced()
+        self.reader_mode_active = bool(active)
+        if not was_synced and self.is_reader_synced():
+            if self._inflight is not None and not self._inflight.done():
+                self._inflight.cancel()
+                self._inflight = None
+            if self._narration.strip():
+                self._enqueue_completed_sentences(is_complete=False)
+
+    def is_reader_synced(self) -> bool:
+        cfg = self._get_config() or {}
+        return self.reader_mode_active and bool(cfg.get("sync_stage_reader", True))
+
     def start_turn(self, state: dict | None) -> None:
         s = state or {}
         history = list(s.get("history") or [])
@@ -258,14 +487,30 @@ class JevDirector:
         self._narration = ""
         self._chars_since_eval = 0
         self._dirty = False
+        self._on_turn_settled = None
+
+        if self._sentence_worker is not None and not self._sentence_worker.done():
+            self._sentence_worker.cancel()
+        self._sentence_worker = None
+        self._seq += 1
+        self._queued_count = 0
+        self._pending_sentences = []
+        self._sentence_cues = {}
+        self._simulated_strength = float(self._get_current_strength())
+        self._active_reader_idx = -1
 
     def invalidate(self) -> None:
         """Cancel any in-flight JEV call so it cannot overwrite manual STOP/changes."""
         self._seq += 1
         self._dirty = False
+        self._on_turn_settled = None
         if self._inflight is not None and not self._inflight.done():
             self._inflight.cancel()
         self._inflight = None
+        if self._sentence_worker is not None and not self._sentence_worker.done():
+            self._sentence_worker.cancel()
+        self._sentence_worker = None
+        self._pending_sentences = []
 
     def feed_token(self, token: str) -> None:
         if not token:
@@ -273,6 +518,10 @@ class JevDirector:
         self._narration += token
         self._chars_since_eval += len(token)
         if not self._narration.strip():
+            return
+
+        if self.is_reader_synced():
+            self._enqueue_completed_sentences(is_complete=False)
             return
 
         has_boundary = bool(_BEAT_BOUNDARY.search(token))
@@ -290,15 +539,220 @@ class JevDirector:
             return
         self._schedule(step="toy:stream")
 
-    def finish_turn(self) -> None:
+    def finish_turn(self, on_settled=None) -> None:
         """Evaluate the completed turn so the resting latch matches the closing beat."""
         if not self._narration.strip():
+            if on_settled is not None:
+                on_settled()
             return
+
+        if self.is_reader_synced():
+            self._enqueue_completed_sentences(is_complete=True)
+            return
+
+        if on_settled is not None:
+            self._on_turn_settled = on_settled
         if self._inflight is not None and not self._inflight.done():
             self._dirty = True
             return
         if self._chars_since_eval > 0 or self._dirty:
             self._schedule(step="toy:turn_end")
+        elif self._on_turn_settled is not None:
+            cb = self._on_turn_settled
+            self._on_turn_settled = None
+            cb()
+
+    # ---------------------------------------- Stage Reader lookahead pipeline
+
+    def _get_cue_event(self) -> asyncio.Event:
+        if self._cue_event is None:
+            self._cue_event = asyncio.Event()
+        return self._cue_event
+
+    def _enqueue_completed_sentences(self, *, is_complete: bool) -> None:
+        segs = split_stage_sentences(self._narration, is_complete=is_complete)
+        cleaned = strip_stage_hidden_blocks(self._narration)
+        added = False
+        for seg in segs:
+            idx = seg["index"]
+            if not seg["complete"] or idx < self._queued_count:
+                continue
+            preceding = cleaned[: seg["char_start"]].strip()
+            self._pending_sentences.append({
+                **seg,
+                "preceding": preceding,
+            })
+            self._queued_count = idx + 1
+            added = True
+        if added:
+            self._ensure_sentence_worker()
+
+    def _ensure_sentence_worker(self) -> None:
+        if self._sentence_worker is not None and not self._sentence_worker.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        seq = self._seq
+        self._sentence_worker = loop.create_task(self._drain_sentence_queue(seq))
+
+    async def _drain_sentence_queue(self, seq: int) -> None:
+        try:
+            while self._pending_sentences and seq == self._seq:
+                item = self._pending_sentences.pop(0)
+                idx = item["index"]
+                if idx in self._sentence_cues:
+                    continue
+                verdict = await self._score_sentence_item(seq, item)
+                if seq != self._seq:
+                    return
+                if verdict is not None:
+                    self._sentence_cues[idx] = {
+                        "index": idx,
+                        "char_start": item["char_start"],
+                        "char_end": item["char_end"],
+                        "text": item["text"],
+                        "verdict": verdict,
+                    }
+                    if verdict.get("action") == "apply":
+                        self._simulated_strength = float(verdict.get("strength", 0.0))
+                    ev = self._get_cue_event()
+                    ev.set()
+                    ev.clear()
+        finally:
+            if self._sentence_worker is asyncio.current_task():
+                self._sentence_worker = None
+                if self._pending_sentences and seq == self._seq:
+                    self._ensure_sentence_worker()
+
+    async def _score_sentence_item(self, seq: int, item: dict) -> dict | None:
+        enabled_patterns = self._enabled_patterns()
+        questions = build_sentence_questions(enabled_patterns)
+        state_payload = {
+            "recent_story": self._recent_story,
+            "player_action": self._player_action,
+            "turn_so_far": item.get("preceding", ""),
+            "current_sentence": item["text"],
+            "current_haptic_strength": round(float(self._simulated_strength), 1),
+        }
+        decision = None
+        try:
+            decision = await self._decide_call(state_payload, questions, f"toy:sentence_{item['index']}")
+            self.calls += 1
+            if seq != self._seq:
+                if decision is not None and not getattr(decision, "finished", True):
+                    await decision.finish("cancelled")
+                return None
+
+            answers = getattr(decision, "answers", None) or {}
+            if not answers:
+                reason = getattr(decision, "reason", "") or "JEV unavailable"
+                self.last_error = reason
+                if decision is not None and not getattr(decision, "finished", True):
+                    await decision.finish("fallback", reason)
+                return None
+
+            sensitivity = float(self._jev_cfg().get("sensitivity", 1.0) or 1.0)
+            verdict = interpret_answers(
+                answers,
+                enabled_patterns=enabled_patterns,
+                current_strength=float(self._simulated_strength),
+                sensitivity=sensitivity,
+                pattern_override=self.pattern_override,
+            )
+            self.last_verdict = verdict
+            self.last_error = ""
+            if decision is not None and not getattr(decision, "finished", True):
+                await decision.finish("accepted" if verdict["action"] == "apply" else "skipped", verdict.get("reason", ""))
+            return verdict
+        except asyncio.CancelledError:
+            if decision is not None and not getattr(decision, "finished", True):
+                await decision.finish("cancelled")
+            raise
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            if decision is not None and not getattr(decision, "finished", True):
+                await decision.finish("fallback", self.last_error)
+            return None
+
+    def _find_matching_cue(self, sentence_index: int, char_start: int, char_end: int) -> dict | None:
+        exact = self._sentence_cues.get(sentence_index)
+        if exact is not None and abs(exact["char_start"] - char_start) <= 32:
+            return exact
+        best = None
+        best_overlap = 0
+        for cue in self._sentence_cues.values():
+            ov = min(char_end, cue["char_end"]) - max(char_start, cue["char_start"])
+            if ov > best_overlap:
+                best_overlap = ov
+                best = cue
+        return best
+
+    async def on_reader_sentence(
+        self,
+        *,
+        sentence_index: int,
+        char_start: int = 0,
+        char_end: int = 0,
+        text: str = "",
+    ) -> dict | None:
+        """Apply the pre-scored cue for the sentence now appearing on Stage."""
+        self.reader_mode_active = True
+        if not bool((self._get_config() or {}).get("sync_stage_reader", True)):
+            return None
+
+        self._active_reader_idx = sentence_index
+        seq_at_call = self._seq
+
+        cue = self._find_matching_cue(sentence_index, char_start, char_end)
+        if cue is None and self._sentence_worker is not None and not self._sentence_worker.done():
+            # Wait briefly if JEV is finishing this very sentence right now
+            deadline = self._clock() + 1.2
+            while cue is None and seq_at_call == self._seq and self._clock() < deadline:
+                if self._sentence_worker is None or self._sentence_worker.done():
+                    break
+                try:
+                    await asyncio.wait_for(self._get_cue_event().wait(), timeout=0.15)
+                except asyncio.TimeoutError:
+                    pass
+                cue = self._find_matching_cue(sentence_index, char_start, char_end)
+
+        if cue is not None:
+            verdict = cue["verdict"]
+        elif text.strip():
+            cleaned = strip_stage_hidden_blocks(self._narration)
+            preceding = cleaned[: max(0, char_start)].strip() if cleaned else ""
+            verdict = await self._score_sentence_item(
+                seq_at_call,
+                {
+                    "index": sentence_index,
+                    "char_start": char_start,
+                    "char_end": char_end or len(text),
+                    "text": text,
+                    "preceding": preceding,
+                },
+            )
+            if verdict is not None and seq_at_call == self._seq:
+                self._sentence_cues[sentence_index] = {
+                    "index": sentence_index,
+                    "char_start": char_start,
+                    "char_end": char_end or len(text),
+                    "text": text,
+                    "verdict": verdict,
+                }
+        else:
+            return None
+
+        if verdict is None or seq_at_call != self._seq or self._active_reader_idx != sentence_index:
+            return verdict
+
+        if verdict.get("action") == "apply":
+            eff = dict(verdict)
+            if self.pattern_override:
+                eff["pattern"] = normalize_pattern(self.pattern_override)
+            self._apply_effect(eff)
+        return verdict
 
     def _schedule(self, step: str = "toy:stream") -> None:
         try:
@@ -375,6 +829,10 @@ class JevDirector:
                     self._schedule(step="toy:stream_followup")
                 else:
                     self._schedule_delayed(min_interval - elapsed)
+            elif seq == self._seq and self._on_turn_settled is not None:
+                cb = self._on_turn_settled
+                self._on_turn_settled = None
+                cb()
 
     def _schedule_delayed(self, delay_s: float) -> None:
         try:
@@ -426,4 +884,7 @@ class JevDirector:
             "last_verdict": self.last_verdict,
             "last_error": self.last_error,
             "pattern_override": self.pattern_override,
+            "reader_synced": self.is_reader_synced(),
+            "reader_mode_active": self.reader_mode_active,
+            "pre_scored_sentences": len(self._sentence_cues),
         }

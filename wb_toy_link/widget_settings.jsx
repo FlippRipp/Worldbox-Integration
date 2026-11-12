@@ -195,6 +195,50 @@ export default function ToyLinkSettings({ config, onSaveConfig }) {
         </div>
       )}
 
+      {globalCfg && (
+        <div className="space-y-3 pt-1">
+          <div>
+            <span className="block text-xs text-gray-400 mb-1">Between storyteller blocks</span>
+            <div className="flex rounded-md overflow-hidden border border-gray-700">
+              {[
+                ['continue', 'Continue Last'],
+                ['low', 'Low (~20%)'],
+                ['stop', 'Stop'],
+              ].map(([id, label]) => {
+                const cur = globalCfg.between_blocks || (globalCfg.stop_on_turn_end ? 'stop' : 'continue');
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => updateGlobal({ between_blocks: id, stop_on_turn_end: id === 'stop' })}
+                    className={`flex-1 py-1.5 text-xs font-medium ${
+                      cur === id
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-900 text-gray-400 hover:text-gray-200'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <label className="flex items-center justify-between gap-3 cursor-pointer pt-1">
+            <div>
+              <div className="text-xs font-medium text-gray-200">Sentence sync in Paced Stage mode</div>
+              <div className="text-[11px] text-gray-500">Pre-score sentences ahead and sync haptics to reading speed.</div>
+            </div>
+            <input
+              type="checkbox"
+              checked={globalCfg.sync_stage_reader !== false}
+              onChange={(e) => updateGlobal({ sync_stage_reader: e.target.checked })}
+              className="w-4 h-4 accent-purple-500"
+            />
+          </label>
+        </div>
+      )}
+
       <p className="text-xs text-gray-500">
         Open <span className="text-gray-300">Toy Studio</span> from the main menu to preview and customize the pattern gallery.
       </p>

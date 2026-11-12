@@ -25,7 +25,10 @@ DEFAULT_CONFIG: dict = {
     "master_cap_global": 100,
     "contrast_mode": "balanced",       # "subtle" | "balanced" | "high"
     "response_feel": "natural",        # "silky" | "natural" | "snappy"
+    "between_blocks": "continue",      # "continue" | "low" | "stop"
+    "low_between_strength": 20,
     "stop_on_turn_end": False,
+    "sync_stage_reader": True,
     "tick_hz": 20,
     "enabled_patterns": list(PATTERNS),
     "jev": {
@@ -69,24 +72,40 @@ class ConfigStore:
             json.dump(data, f, indent=2, ensure_ascii=False)
         tmp.replace(self.root / name)
 
+    def _normalize_loaded(raw_disk: dict, merged: dict) -> dict:
+        valid = [p for p in (merged.get("enabled_patterns") or []) if p in PATTERNS]
+        merged["enabled_patterns"] = valid or list(PATTERNS)
+        # Migrate legacy boolean `stop_on_turn_end` if `between_blocks` wasn't set yet
+        if "between_blocks" not in (raw_disk or {}) and raw_disk.get("stop_on_turn_end") is True:
+            merged["between_blocks"] = "stop"
+        if merged.get("between_blocks") not in ("continue", "low", "stop"):
+            merged["between_blocks"] = "stop" if merged.get("stop_on_turn_end") else "continue"
+        merged["stop_on_turn_end"] = merged["between_blocks"] == "stop"
+        return merged
+
     def config(self) -> dict:
         with self._lock:
             if self._config is None:
-                merged = _deep_merge(DEFAULT_CONFIG, self._read_json(CONFIG_FILE))
-                # Ensure enabled_patterns only keeps valid known pattern ids
-                valid = [p for p in (merged.get("enabled_patterns") or []) if p in PATTERNS]
-                merged["enabled_patterns"] = valid or list(PATTERNS)
-                self._config = merged
+                raw_disk = self._read_json(CONFIG_FILE)
+                merged = _deep_merge(DEFAULT_CONFIG, raw_disk)
+                self._config = ConfigStore._normalize_loaded(raw_disk, merged)
             return json.loads(json.dumps(self._config))
 
     def save_config(self, updates: dict) -> dict:
         with self._lock:
-            base = self._config if self._config is not None else _deep_merge(
-                DEFAULT_CONFIG, self._read_json(CONFIG_FILE)
+            raw_disk = self._read_json(CONFIG_FILE)
+            base = self._config if self._config is not None else ConfigStore._normalize_loaded(
+                raw_disk, _deep_merge(DEFAULT_CONFIG, raw_disk)
             )
-            merged = _deep_merge(base, updates)
+            upd = dict(updates or {})
+            if "stop_on_turn_end" in upd and "between_blocks" not in upd:
+                upd["between_blocks"] = "stop" if upd["stop_on_turn_end"] else "continue"
+            merged = _deep_merge(base, upd)
             valid = [p for p in (merged.get("enabled_patterns") or []) if p in PATTERNS]
             merged["enabled_patterns"] = valid or list(PATTERNS)
+            if merged.get("between_blocks") not in ("continue", "low", "stop"):
+                merged["between_blocks"] = "continue"
+            merged["stop_on_turn_end"] = merged["between_blocks"] == "stop"
             self._config = merged
             self._write_json(CONFIG_FILE, merged)
             return json.loads(json.dumps(merged))

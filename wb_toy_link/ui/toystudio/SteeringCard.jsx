@@ -135,12 +135,27 @@ export default function SteeringCard({ config, saveConfig, status, api, refresh 
         </Field>
       </div>
 
-      <div className="pt-1 border-t border-gray-700/50 flex flex-wrap items-center justify-between gap-4">
+      <div className="pt-2 border-t border-gray-700/50 space-y-4">
+        <Field
+          label="Between Storyteller Blocks"
+          hint="What your toy should do once a storyteller block finishes (or when Paced Stage finishes revealing the block)."
+        >
+          <Segmented
+            value={config.between_blocks || (config.stop_on_turn_end ? 'stop' : 'continue')}
+            onChange={(v) => saveConfig({ between_blocks: v, stop_on_turn_end: v === 'stop' })}
+            options={[
+              { id: 'continue', label: 'Continue Last', hint: 'Keep the closing pattern & intensity playing while you reply' },
+              { id: 'low', label: 'Low Intensity', hint: 'Ease active scenes down to a gentle ~20% Velvet simmer between blocks' },
+              { id: 'stop', label: 'Stop', hint: 'Stop automatically between storyteller blocks' },
+            ]}
+          />
+        </Field>
+
         <Toggle
-          label="Stop automatically as soon as a turn finishes"
-          hint="Off (recommended): keeps the closing mood playing while you read, or gently fades during Afterglow."
-          checked={!!config.stop_on_turn_end}
-          onChange={(v) => saveConfig({ stop_on_turn_end: v })}
+          label="Sync haptics sentence-by-sentence in Paced Stage mode"
+          hint="When Worldbox is set to Paced Stage mode, JEV pre-scores sentences ahead of your reading cursor so toy transitions fire right as each sentence appears."
+          checked={config.sync_stage_reader !== false}
+          onChange={(v) => saveConfig({ sync_stage_reader: v })}
         />
       </div>
 

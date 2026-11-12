@@ -24,6 +24,62 @@ const PATTERN_LIST = [
 const store = { status: null, listeners: new Set(), timer: null };
 let widgetMountCount = 0;
 let leaveTimer = null;
+let readerBridgeCleanup = null;
+
+function currentHostReaderMode() {
+  if (typeof window !== 'undefined' && window.__wbReaderMode) {
+    return window.__wbReaderMode === 'stage' ? 'stage' : 'feed';
+  }
+  try {
+    return storage.getItem('wb_display_mode') === 'stage' ? 'stage' : 'feed';
+  } catch (e) {
+    return 'feed';
+  }
+}
+
+function attachReaderBridge() {
+  if (readerBridgeCleanup || typeof window === 'undefined') return;
+  const pushMode = (mode) => {
+    fetch(`${API}/reader-sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phase: 'mode', mode }),
+    }).then(() => poll()).catch(() => {});
+  };
+
+  pushMode(currentHostReaderMode());
+
+  const onMode = (e) => {
+    const mode = e?.detail?.mode === 'stage' ? 'stage' : 'feed';
+    pushMode(mode);
+  };
+
+  const onSync = (e) => {
+    const d = e?.detail || {};
+    if (!d.phase) return;
+    fetch(`${API}/reader-sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        phase: d.phase,
+        turn_id: d.turnId,
+        sentence_index: d.sentenceIndex ?? 0,
+        char_start: d.charStart ?? 0,
+        char_end: d.charEnd ?? 0,
+        text: d.text || '',
+        reason: d.reason || '',
+      }),
+    }).then(() => poll()).catch(() => {});
+  };
+
+  window.addEventListener('wb:reader-mode', onMode);
+  window.addEventListener('wb:reader-sync', onSync);
+  readerBridgeCleanup = () => {
+    window.removeEventListener('wb:reader-mode', onMode);
+    window.removeEventListener('wb:reader-sync', onSync);
+    readerBridgeCleanup = null;
+  };
+}
 
 function notify() {
   store.listeners.forEach((fn) => fn());
@@ -247,6 +303,7 @@ export default function ToyLinkWidget({ state, config }) {
   // Stop toys cleanly when the last sidebar instance unmounts (leaving story to Main Menu)
   useEffect(() => {
     widgetMountCount += 1;
+    attachReaderBridge();
     if (leaveTimer) {
       clearTimeout(leaveTimer);
       leaveTimer = null;
@@ -254,6 +311,7 @@ export default function ToyLinkWidget({ state, config }) {
     return () => {
       widgetMountCount = Math.max(0, widgetMountCount - 1);
       if (widgetMountCount === 0) {
+        if (readerBridgeCleanup) readerBridgeCleanup();
         leaveTimer = setTimeout(() => {
           if (widgetMountCount === 0) {
             fetch(`${API}/story-leave`, { method: 'POST' }).catch(() => {});
@@ -276,6 +334,17 @@ export default function ToyLinkWidget({ state, config }) {
   const jev = status.jev || {};
   const toys = lov.devices || [];
   const patternOverride = jev.pattern_override || 'auto';
+  const stageActive = !!jev.reader_mode_active;
+  const stageSynced = !!jev.reader_synced;
+
+  const toggleHostStage = () => {
+    if (typeof window === 'undefined') return;
+    window.dispatchEvent(
+      new CustomEvent('wb:set-display-mode', {
+        detail: { mode: stageActive ? 'feed' : 'stage' },
+      })
+    );
+  };
 
   const reconnectLovense = async () => {
     setBusyConnect(true);
@@ -364,6 +433,31 @@ export default function ToyLinkWidget({ state, config }) {
               Enable
             </button>
           )}
+        </div>
+
+        <div className="flex items-center justify-between gap-2 text-gray-400">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Dot ok={stageSynced} warn={stageActive && !stageSynced} />
+            <span className="truncate">
+              {stageSynced
+                ? 'Synced Stage active'
+                : stageActive
+                  ? 'Stage on (sync off)'
+                  : 'Classic log view'}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={toggleHostStage}
+            className={`px-2 py-0.5 rounded border shrink-0 transition-colors ${
+              stageActive
+                ? 'bg-purple-600/25 hover:bg-purple-600/40 text-purple-200 border-purple-500/40'
+                : 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+            }`}
+            title="Switch between classic Story Log and Paced Stage synced reader"
+          >
+            {stageActive ? 'Use Log' : 'Stage Mode'}
+          </button>
         </div>
       </div>
 

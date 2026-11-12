@@ -31,3 +31,18 @@ def test_enabled_patterns_filters_invalid_and_never_empties(tmp_path):
     # Empty or all-invalid falls back to full pattern set so JEV always has a palette
     saved2 = store.save_config({"enabled_patterns": ["invalid_only"]})
     assert saved2["enabled_patterns"] == list(PATTERNS)
+
+
+def test_legacy_stop_on_turn_end_migrates_to_between_blocks(tmp_path):
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({"stop_on_turn_end": True}), encoding="utf-8")
+    store = ConfigStore(tmp_path)
+    cfg = store.config()
+    assert cfg["between_blocks"] == "stop"
+    assert cfg["stop_on_turn_end"] is True
+
+    updated = store.save_config({"between_blocks": "low"})
+    assert updated["between_blocks"] == "low"
+    assert updated["stop_on_turn_end"] is False
+
