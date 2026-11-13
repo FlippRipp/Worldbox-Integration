@@ -227,4 +227,32 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
     await run_ticks(manager, clock, 240)
     assert len(pclient.patterns) == 3
 
+    # 4. Seamless handoff between different patterns (Velvet -> Ocean Swell -> Heartbeat)
+    # bridges from live hardware level without starting on a 0% gap, and minor same-pattern
+    # nudges do not interrupt the active hardware loop!
+    pclient.patterns.clear()
+    vibe.set_target(72, "velvet", {"sentence_cue": True, "cue_id": 10, "arc": "steady", "duration_s": 3.0})
+    await run_ticks(manager, clock, 40)  # 2.0s in: Velvet actively spinning around ~0.62
+    assert len(pclient.patterns) == 1
+
+    # Minor same-pattern nudge (< 5%) sends ZERO reset packets
+    vibe.set_target(74, "velvet", {"sentence_cue": True, "cue_id": 11, "arc": "steady", "duration_s": 3.0})
+    await run_ticks(manager, clock, 40)
+    assert len(pclient.patterns) == 1
+
+    # Switch from Velvet (~62%) into Ocean Swell (85%): starts right on Swell's rising slope (> 0.50), NOT 0.0!
+    vibe.set_target(85, "swell", {"sentence_cue": True, "cue_id": 12, "arc": "steady", "duration_s": 4.0})
+    await run_ticks(manager, clock, 60)  # 3.0s into Swell
+    assert len(pclient.patterns) == 2
+    swell_lv, _, _, _ = pclient.patterns[-1]
+    assert swell_lv[0] >= 0.50
+
+    # Switch from active Swell into Heartbeat (85%): enters cleanly on active beat (> 0.45), NOT 0.0 diastole!
+    vibe.set_target(85, "heartbeat", {"sentence_cue": True, "cue_id": 13, "arc": "steady", "duration_s": 3.2})
+    await run_ticks(manager, clock, 20)
+    assert len(pclient.patterns) == 3
+    hb_lv, _, _, _ = pclient.patterns[-1]
+    assert hb_lv[0] >= 0.45
+
+
 

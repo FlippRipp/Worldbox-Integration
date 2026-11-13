@@ -285,8 +285,10 @@ def build_questions(enabled_patterns: list[str] | tuple[str, ...] = PATTERNS) ->
             "type": "noul",
             "instructions": (
                 "Is physical touch, bodily intimacy, or erotic stimulation actively "
-                "happening RIGHT NOW at the latest moment of current_narration? "
-                "Answer no for negations ('did not touch'), memories, plans, or non-physical dialogue."
+                "happening or still ongoing at the latest moment of current_narration? "
+                "Brief spoken dialogue, breathing, or eye contact occurring WHILE characters "
+                "remain in an active physical embrace is still yes. "
+                "Answer no for negations ('did not touch'), memories, plans, or when characters pull apart."
             ),
         },
         "wind_down": {

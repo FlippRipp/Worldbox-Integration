@@ -303,5 +303,51 @@ def test_stitched_line_blocks_connect_edge_to_edge_around_loop():
     assert abs(eval_block_pattern(spec, 0.9999) - 0.2) < 1e-3
 
 
+def test_active_story_transitions_align_phase_without_zero_seam_gap():
+    from toylink.lovense_client import _percent_to_lovense
+    from toylink.patterns import build_lovense_phrase, sanitize_block_pattern
+
+    # 1. Switching from active 62% vibration into Ocean Swell, Heartbeat, Rhythm, or Custom Wave+Saw
+    # must NEVER drop to a 0/20 motor-brake gap at the start of the phrase!
+    custom_spec = sanitize_block_pattern({
+        "id": "wave_saw",
+        "label": "Wave + Saw",
+        "loop_seconds": 6.0,
+        "blocks": [
+            {"type": "wave", "repeat": 2, "peak": 1.0, "floor": 0.0},
+            {"type": "saw_up", "repeat": 2, "peak": 1.0, "floor": 0.0},
+        ],
+    })
+    for pat_id, pdef in [
+        ("swell", None),
+        ("heartbeat", None),
+        ("rhythm", None),
+        ("wave_saw", custom_spec),
+    ]:
+        lv, _, _ = build_lovense_phrase(
+            pat_id,
+            intensity_norm=0.85,
+            entry_norm=0.62,
+            arc="steady",
+            pattern_def=pdef,
+        )
+        steps = [_percent_to_lovense(x) for x in lv]
+        # Entry step matches live motor speed (~12/20) instead of slamming to 0/20!
+        assert steps[0] >= 10, f"{pat_id} dropped to {steps[0]}/20 on active handoff"
+        assert max(steps) >= 16
+
+    # 2. Updating Ocean Swell mid-climb preserves live phase instead of resetting to 0%
+    mid_swell, _, _ = build_lovense_phrase(
+        "swell",
+        intensity_norm=0.90,
+        entry_norm=0.55,
+        live_phase=0.45,
+        same_pattern=True,
+    )
+    assert mid_swell[0] >= 0.50
+    assert max(mid_swell[:15]) >= 0.82
+
+
+
 
 

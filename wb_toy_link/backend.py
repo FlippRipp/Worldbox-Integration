@@ -280,9 +280,8 @@ async def _apply_between_blocks_policy() -> None:
             _manager.ensure_running()
         return
 
-    # mode == "continue": clear per-sentence arc flag so between-blocks rests on a pure steady loop
-    if _vibe.strength > 0.5 and _vibe.pattern != "afterglow" and _vibe.params.get("sentence_cue"):
-        _vibe.set_target(_vibe.strength, _vibe.pattern, {}, source=_vibe.source or "between:continue", pace=_vibe.pace)
+    # mode == "continue": leave the active hardware loop running without forcing a BLE reset packet
+    if _vibe.strength > 0.5 and _vibe.pattern != "afterglow":
         _manager.ensure_running()
 
 

@@ -765,7 +765,68 @@ def _eval_single(
     return 1.0
 
 
-def build_lovense_phrase(
+def _select_transition_rotation(
+    unit_weights: list[float],
+    *,
+    norm_i: float,
+    start_arc_gain: float,
+    entry_norm: float | None,
+    live_phase: float | None,
+    same_pattern: bool,
+    arc: str,
+) -> int:
+    """Pick cyclic start index ``0..n-1`` so active transitions never drop to a 0 brake seam."""
+    n = len(unit_weights)
+    if n <= 1:
+        return 0
+    if entry_norm is None or entry_norm <= 0.035:
+        if same_pattern and live_phase is not None:
+            return int(round((float(live_phase) % 1.0) * n)) % n
+        return 0
+
+    eff_scale = max(0.05, norm_i * start_arc_gain)
+    cand_levels = [_clamp(w * eff_scale, 0.0, 1.0) for w in unit_weights]
+    max_lv = max(cand_levels)
+    has_nonzero = max_lv >= 0.04
+
+    if same_pattern and live_phase is not None:
+        rot_k = int(round((float(live_phase) % 1.0) * n)) % n
+        if has_nonzero and cand_levels[rot_k] < 0.035 and entry_norm >= 0.06:
+            # Nudge out of a zero-step notch onto the immediate rising edge
+            for step_ahead in range(1, min(6, n)):
+                cand_idx = (rot_k + step_ahead) % n
+                if cand_levels[cand_idx] >= 0.04:
+                    return cand_idx
+        return rot_k
+
+    best_k = 0
+    best_cost = 1e9
+    prefer_ease = (arc == "ease") or (max_lv < entry_norm - 0.06)
+
+    for k in range(n):
+        val = cand_levels[k]
+        nxt = cand_levels[(k + 1) % n]
+        nxt2 = cand_levels[(k + 2) % n]
+        slope = (nxt - val) + 0.5 * (nxt2 - nxt)
+
+        cost = abs(val - entry_norm)
+        if has_nonzero and val < 0.035:
+            cost += 0.65
+        if has_nonzero and nxt < 0.035 and max_lv >= 0.12:
+            cost += 0.22
+        if prefer_ease:
+            if slope > 0.03:
+                cost += 0.05
+        else:
+            if slope < -0.008:
+                cost += 0.075
+        if cost < best_cost:
+            best_cost = cost
+            best_k = k
+    return best_k
+
+
+def build_lovense_phrase_with_phase(
     pattern: str,
     *,
     intensity_norm: float,
@@ -777,20 +838,10 @@ def build_lovense_phrase(
     arc: str = "steady",
     duration_s: float | None = None,
     pattern_def: dict | None = None,
-) -> tuple[list[float], int, bool]:
-    """Synthesize a Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``.
-
-    - Supports both procedural built-ins and custom/edited Shape-Block patterns.
-    - When ``loop=True`` and ``entry_norm is None`` and ``arc == "steady"``,
-      carrier cycles complete exact integer multiples across ``steps`` so the end
-      wraps to ``steps[0]`` seamlessly inside Lovense with ``timeSec: 0`` and ZERO
-      refresh packets.
-    - When ``entry_norm`` or a shaped ``arc`` (``rise`` | ``surge`` | ``ease``) is
-      supplied for a Stage sentence cue, the opening ~0.75 s smoothly blends from
-      ``entry_norm`` into the sentence's arc contour timed to ``duration_s``.
-    - When ``loop=False`` and ``pattern == "afterglow"`` (story wind-down),
-      synthesizes a single 9.5 s decaying cosine phrase ending on ``0;0;0;0``.
-    """
+    live_phase: float | None = None,
+    same_pattern: bool = False,
+) -> tuple[list[float], int, bool, float]:
+    """Synthesize a Lovense ``Pattern`` phrase + starting normalized phase ``u0``."""
     custom_spec = (
         sanitize_block_pattern(pattern_def)
         if isinstance(pattern_def, dict)
@@ -803,6 +854,8 @@ def build_lovense_phrase(
     norm_i = _clamp(float(intensity_norm), 0.0, 1.0)
     c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
     use_arc = normalize_arc(arc)
+    clamped_entry = None if entry_norm is None else _clamp(float(entry_norm), 0.0, 1.0)
+    start_arc = sentence_arc_gain(use_arc, 0.0)
 
     if custom_spec is not None:
         use_pace = _clamp(custom_spec["default_pace"] if pace is None else float(pace))
@@ -824,7 +877,7 @@ def build_lovense_phrase(
                     contrast_mode=contrast_mode,
                 )
                 levels_decay.append(round(_clamp(norm_i * env * w), 4))
-            return levels_decay, interval_ms, False
+            return levels_decay, interval_ms, False, 0.0
 
         dur_s = _custom_loop_seconds(custom_spec, use_pace)
         n = _choose_harmonic_steps(custom_spec["blocks"], steps, loop_dur_s=dur_s)
@@ -835,25 +888,42 @@ def build_lovense_phrase(
             intensity_norm=norm_i,
             contrast_mode=contrast_mode,
         )
-        shaped_sentence = (entry_norm is not None) or (use_arc != "steady")
+        rot_k = _select_transition_rotation(
+            unit_steps,
+            norm_i=norm_i,
+            start_arc_gain=start_arc,
+            entry_norm=clamped_entry,
+            live_phase=live_phase,
+            same_pattern=same_pattern,
+            arc=use_arc,
+        )
+        if rot_k:
+            unit_steps = unit_steps[rot_k:] + unit_steps[:rot_k]
+        phase_u0 = (rot_k / n) % 1.0
+
+        shaped_sentence = (clamped_entry is not None) or (use_arc != "steady")
         phrase_dur_s = (n * interval_ms) / 1000.0
         win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
-        ramp_s = 0.72
-        clamped_entry = None if entry_norm is None else _clamp(float(entry_norm), 0.0, 1.0)
+        ramp_s = 0.65
 
         levels_custom: list[float] = []
         for k, w in enumerate(unit_steps):
             if shaped_sentence:
                 t_k = ((k + 0.5) * interval_ms) / 1000.0
                 arc_prog = min(1.0, t_k / win_s)
-                local_i = _clamp(norm_i * sentence_arc_gain(use_arc, arc_prog), 0.0, 1.0)
+                arc_i = _clamp(norm_i * sentence_arc_gain(use_arc, arc_prog), 0.0, 1.0)
+                target_val = _clamp(w * arc_i, 0.0, 1.0)
                 if clamped_entry is not None and t_k < ramp_s:
                     blend = 0.5 - 0.5 * math.cos(math.pi * (t_k / ramp_s))
-                    local_i = _clamp(clamped_entry * (1.0 - blend) + local_i * blend, 0.0, 1.0)
+                    val = _clamp(clamped_entry * (1.0 - blend) + target_val * blend, 0.0, 1.0)
+                    if k == 0 and clamped_entry >= 0.05 and norm_i >= 0.05:
+                        val = max(val, min(clamped_entry, 0.055))
+                else:
+                    val = target_val
             else:
-                local_i = norm_i
-            levels_custom.append(round(_clamp(w * local_i), 4))
-        return levels_custom, interval_ms, True
+                val = _clamp(w * norm_i, 0.0, 1.0)
+            levels_custom.append(round(val, 4))
+        return levels_custom, interval_ms, True, phase_u0
 
     spec = PATTERN_SPECS[pat]
     use_pace = _clamp(spec["default_pace"] if pace is None else float(pace))
@@ -871,8 +941,11 @@ def build_lovense_phrase(
             env = 0.5 + 0.5 * math.cos(math.pi * (k / active_n))  # smooth cosine fade 1 -> 0
             u = (2.5 * (k / active_n)) % 1.0
             swell = 0.22 + 0.78 * (0.5 - 0.5 * math.cos(TAU * u))
-            levels.append(round(_clamp(norm_i * env * swell), 4))
-        return levels, interval_ms, False
+            val = _clamp(norm_i * env * swell)
+            if k == 0 and clamped_entry is not None and clamped_entry > 0.05:
+                val = _clamp(0.55 * clamped_entry + 0.45 * val)
+            levels.append(round(val, 4))
+        return levels, interval_ms, False, 0.0
 
     # Loop-seamless phrase grid (integer cycles across n steps)
     if pat == "velvet":
@@ -907,26 +980,11 @@ def build_lovense_phrase(
         k_contrast = 6
 
     interval_ms = max(110, interval_ms)
-    shaped_sentence = (entry_norm is not None) or (use_arc != "steady")
-    phrase_dur_s = (n * interval_ms) / 1000.0
-    win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
-    ramp_s = 0.72
-    clamped_entry = None if entry_norm is None else _clamp(float(entry_norm), 0.0, 1.0)
-
-    levels = []
     sub_offsets = (0.125, 0.375, 0.625, 0.875)
 
+    # 1. Sample pure periodic unit carrier weights across [0..1)
+    unit_weights: list[float] = []
     for k in range(n):
-        if shaped_sentence:
-            t_k = ((k + 0.5) * interval_ms) / 1000.0
-            arc_prog = min(1.0, t_k / win_s)
-            local_i = _clamp(norm_i * sentence_arc_gain(use_arc, arc_prog), 0.0, 1.0)
-            if clamped_entry is not None and t_k < ramp_s:
-                blend = 0.5 - 0.5 * math.cos(math.pi * (t_k / ramp_s))
-                local_i = _clamp(clamped_entry * (1.0 - blend) + local_i * blend, 0.0, 1.0)
-        else:
-            local_i = norm_i
-
         acc = 0.0
         for off in sub_offsets:
             frac_u = (k + off) / n
@@ -936,20 +994,90 @@ def build_lovense_phrase(
             rubato = 0.0 if pat in ("swell", "heartbeat", "tease", "rhythm") else (0.04 * m1)
             phase = m_cycles * frac_u + rubato
             c_phase = k_contrast * frac_u + 0.05 * m1
-            w = _eval_single(
+            acc += _eval_single(
                 pat,
                 phase,
                 frac_u,
                 c_phase,
-                local_i,
+                norm_i,
                 use_pace,
                 c_gain,
                 periodic_lfo=(m1, m2),
             )
-            acc += w * local_i
-        levels.append(round(_clamp(acc / len(sub_offsets)), 4))
+        unit_weights.append(_clamp(acc / len(sub_offsets), 0.0, 1.0))
 
-    return levels, interval_ms, True
+    # 2. Align starting phase so active transitions never drop into a 0% seam gap
+    rot_k = _select_transition_rotation(
+        unit_weights,
+        norm_i=norm_i,
+        start_arc_gain=start_arc,
+        entry_norm=clamped_entry,
+        live_phase=live_phase,
+        same_pattern=same_pattern,
+        arc=use_arc,
+    )
+    if rot_k:
+        unit_weights = unit_weights[rot_k:] + unit_weights[:rot_k]
+    phase_u0 = (rot_k / n) % 1.0
+
+    # 3. Apply sentence arc & true output-level crossfade from live motor level
+    shaped_sentence = (clamped_entry is not None) or (use_arc != "steady")
+    phrase_dur_s = (n * interval_ms) / 1000.0
+    win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
+    ramp_s = 0.65
+
+    levels = []
+    for k, w in enumerate(unit_weights):
+        if shaped_sentence:
+            t_k = ((k + 0.5) * interval_ms) / 1000.0
+            arc_prog = min(1.0, t_k / win_s)
+            arc_i = _clamp(norm_i * sentence_arc_gain(use_arc, arc_prog), 0.0, 1.0)
+            target_val = _clamp(w * arc_i, 0.0, 1.0)
+            if clamped_entry is not None and t_k < ramp_s:
+                blend = 0.5 - 0.5 * math.cos(math.pi * (t_k / ramp_s))
+                val = _clamp(clamped_entry * (1.0 - blend) + target_val * blend, 0.0, 1.0)
+                if k == 0 and clamped_entry >= 0.05 and norm_i >= 0.05:
+                    val = max(val, min(clamped_entry, 0.055))
+            else:
+                val = target_val
+        else:
+            val = _clamp(w * norm_i, 0.0, 1.0)
+        levels.append(round(val, 4))
+
+    return levels, interval_ms, True, phase_u0
+
+
+def build_lovense_phrase(
+    pattern: str,
+    *,
+    intensity_norm: float,
+    pace: float | None = None,
+    contrast_mode: str = "balanced",
+    loop: bool = True,
+    steps: int | None = None,
+    entry_norm: float | None = None,
+    arc: str = "steady",
+    duration_s: float | None = None,
+    pattern_def: dict | None = None,
+    live_phase: float | None = None,
+    same_pattern: bool = False,
+) -> tuple[list[float], int, bool]:
+    """Synthesize a Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``."""
+    levels, interval_ms, is_loop, _ = build_lovense_phrase_with_phase(
+        pattern,
+        intensity_norm=intensity_norm,
+        pace=pace,
+        contrast_mode=contrast_mode,
+        loop=loop,
+        steps=steps,
+        entry_norm=entry_norm,
+        arc=arc,
+        duration_s=duration_s,
+        pattern_def=pattern_def,
+        live_phase=live_phase,
+        same_pattern=same_pattern,
+    )
+    return levels, interval_ms, is_loop
 
 
 def sample_pattern_curve(
