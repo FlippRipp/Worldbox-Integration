@@ -20,6 +20,7 @@ DEFAULT_CONFIG: dict = {
         "port": 20010,
         "https": False,
         "action_mode": "All",          # "All" (all actuators) | "Vibrate"
+        "story_drive_mode": "stream",  # "stream" (zero-gap live crossfade) | "pattern" (hardware loop)
         "use_time_sec_safety": True,
     },
     "master_cap_global": 100,

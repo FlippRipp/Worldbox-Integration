@@ -141,7 +141,7 @@ export default function LovenseCard({ config, saveConfig, status, api, refresh }
         </button>
 
         {showAdvanced && (
-          <div className="mt-3 pt-3 border-t border-gray-700/50 grid sm:grid-cols-3 gap-4 text-xs">
+          <div className="mt-3 pt-3 border-t border-gray-700/50 grid sm:grid-cols-2 lg:grid-cols-4 gap-4 text-xs">
             <Field label="Port" hint="Default 20010 (HTTP) or 30010 (HTTPS)">
               <TextInput
                 type="number"
@@ -156,6 +156,16 @@ export default function LovenseCard({ config, saveConfig, status, api, refresh }
                 options={[
                   { id: 'All', label: 'All Motors' },
                   { id: 'Vibrate', label: 'Vibrate Only' },
+                ]}
+              />
+            </Field>
+            <Field label="Story transitions" hint="Seamless crossfades with zero pattern-reload gaps">
+              <Segmented
+                value={lovCfg.story_drive_mode || 'stream'}
+                onChange={(v) => saveConfig({ lovense: { story_drive_mode: v } })}
+                options={[
+                  { id: 'stream', label: 'Seamless Stream' },
+                  { id: 'pattern', label: 'Hardware Loop' },
                 ]}
               />
             </Field>

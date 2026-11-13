@@ -261,3 +261,36 @@ async def test_reader_synced_mode_prescores_ahead_and_applies_on_sentence_reveal
     # Zero extra JEV calls needed at reveal time because all 4 were already pre-scored!
     assert director.calls == calls_after_prescore
 
+
+def test_pattern_continuity_hysteresis_prevents_marginal_flip_flopping():
+    # Marginal split (swell 0.36 vs current velvet 0.30) keeps active 'velvet' smoothly
+    marginal = make_answers(pattern="swell", pat_conf=0.36)
+    marginal["pattern"]["probabilities"] = {
+        p: (0.36 if p == "swell" else (0.30 if p == "velvet" else 0.068))
+        for p in PATTERNS
+    }
+    v_keep = interpret_answers(
+        marginal,
+        enabled_patterns=list(PATTERNS),
+        current_strength=50.0,
+        current_pattern="velvet",
+        sentence_mode=True,
+    )
+    assert v_keep["pattern"] == "velvet"
+
+    # Clear action shift (rhythm 0.62 vs current velvet 0.12) switches immediately
+    decisive = make_answers(pattern="rhythm", pat_conf=0.62)
+    decisive["pattern"]["probabilities"] = {
+        p: (0.62 if p == "rhythm" else (0.12 if p == "velvet" else 0.052))
+        for p in PATTERNS
+    }
+    v_switch = interpret_answers(
+        decisive,
+        enabled_patterns=list(PATTERNS),
+        current_strength=50.0,
+        current_pattern="velvet",
+        sentence_mode=True,
+    )
+    assert v_switch["pattern"] == "rhythm"
+
+

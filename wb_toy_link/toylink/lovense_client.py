@@ -32,6 +32,7 @@ CANDIDATE_PORTS: tuple[tuple[bool, int], ...] = (
     (True, 34568),
 )
 KEEPALIVE_RESEND_S = 0.85
+LIVE_STEP_INTERVAL_S = 0.11
 MAX_PATTERN_STEPS = 50
 
 
@@ -92,6 +93,7 @@ class LovenseClient:
         self.last_rtt_s: float = 0.025
 
         self._pattern_unsupported: bool = False
+        self._hw_mode: str = "idle"  # "idle" | "function" | "pattern"
         self._last_step: int = 0
         self._last_send_at: float = 0.0
         self._sending: bool = False
@@ -103,6 +105,11 @@ class LovenseClient:
     @property
     def supports_pattern_stream(self) -> bool:
         return (not self._pattern_unsupported) and bool(self._cfg().get("use_pattern_api", True))
+
+    @property
+    def prefers_live_story_stream(self) -> bool:
+        mode = str(self._cfg().get("story_drive_mode", "stream") or "stream").strip().lower()
+        return mode != "pattern"
 
     @property
     def enabled(self) -> bool:
@@ -302,12 +309,56 @@ class LovenseClient:
         }
         await self._enqueue_or_send(("pattern", payload, steps[0], levels[0]))
 
+    async def send_live_level(self, frac: float, *, allow_zero_valley: bool = False) -> None:
+        """Gapless real-time motor streaming (`stopPrevious: 0, timeSec: 0`).
+
+        Unlike `command: "Pattern"` (which resets Lovense Remote's BLE timer on
+        every pattern change) and legacy `set_level` (which omitted `stopPrevious`
+        and resent every 0.85s), `send_live_level` updates motor speed directly in
+        place only when the 0..20 step changes, paced cleanly to BLE's 110ms slot.
+        """
+        if not self.enabled:
+            return
+        step = _percent_to_lovense(frac)
+        if step == 0 and not allow_zero_valley:
+            if self._last_step > 0 or self._hw_mode != "idle":
+                await self.stop()
+            return
+
+        now = self._clock()
+        if step == self._last_step and self._hw_mode == "function" and self.connected:
+            return
+
+        # Pace positive step transitions to BLE's 110ms slot; DeviceManager's 20Hz
+        # ticker automatically delivers the newest step on the next eligible tick.
+        if (
+            step > 0
+            and self._last_step > 0
+            and self._hw_mode == "function"
+            and (now - self._last_send_at) < LIVE_STEP_INTERVAL_S
+            and self.connected
+        ):
+            return
+
+        # If transitioning directly out of an indefinite hardware `Pattern` preview
+        # without an intermediate Stop, clear the hardware loop once on the first packet.
+        stop_prev = 1 if self._hw_mode == "pattern" else 0
+        prefix = self._action_prefix()
+        payload = {
+            "command": "Function",
+            "action": f"{prefix}:{step}",
+            "timeSec": 0,
+            "stopPrevious": stop_prev,
+            "apiVer": 1,
+        }
+        await self._enqueue_or_send(("live_function", payload, step))
+
     async def set_level(self, frac: float) -> None:
         if not self.enabled:
             return
         step = _percent_to_lovense(frac)
         if step == 0:
-            if self._last_step > 0:
+            if self._last_step > 0 or self._hw_mode != "idle":
                 await self.stop()
             return
         now = self._clock()
@@ -328,6 +379,7 @@ class LovenseClient:
         self._pending_op = None
         self._last_step = 0
         self._last_send_at = 0.0
+        self._hw_mode = "idle"
         if not self.enabled:
             return
         payload = {
@@ -355,12 +407,14 @@ class LovenseClient:
                 kind = cur[0]
                 if kind == "stop":
                     await self._post(cur[1])
+                    self._hw_mode = "idle"
                     self._last_step = 0
                     self._last_send_at = 0.0
-                elif kind == "function":
+                elif kind in ("function", "live_function"):
                     _, payload, step = cur
                     ok = await self._post(payload)
                     if ok is not None:
+                        self._hw_mode = "function"
                         self._last_step = step
                         self._last_send_at = self._clock()
                 elif kind == "pattern":
@@ -368,6 +422,7 @@ class LovenseClient:
                     was_connected = self.connected
                     ok = await self._post(payload)
                     if ok is not None:
+                        self._hw_mode = "pattern"
                         self._last_step = first_step
                         self._last_send_at = self._clock()
                     elif was_connected and self.last_error.startswith("Lovense error:"):
@@ -378,10 +433,12 @@ class LovenseClient:
                         fb = await self._post({
                             "command": "Function",
                             "action": f"{prefix}:{s}" if s > 0 else "Stop",
-                            "timeSec": 2 if s > 0 else 0,
+                            "timeSec": 0,
+                            "stopPrevious": 0,
                             "apiVer": 1,
                         })
                         if fb is not None:
+                            self._hw_mode = "function" if s > 0 else "idle"
                             self._last_step = s
                             self._last_send_at = self._clock()
                 cur = self._pending_op
@@ -398,6 +455,7 @@ class LovenseClient:
             "https": https,
             "connected": self.connected,
             "mode": "pattern" if self.supports_pattern_stream else "function",
+            "story_drive_mode": "stream" if self.prefers_live_story_stream else "pattern",
             "rtt_ms": round(self.last_rtt_s * 1000.0, 1),
             "devices": list(self.toys),
             "last_error": self.last_error,
@@ -405,6 +463,7 @@ class LovenseClient:
 
     async def aclose(self) -> None:
         self._pending_op = None
+        self._hw_mode = "idle"
         self._last_step = 0
         if self._client is not None:
             await self._client.aclose()

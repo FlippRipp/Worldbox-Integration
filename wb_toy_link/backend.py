@@ -491,6 +491,8 @@ def _sanitize_config(updates: dict) -> dict:
             lov_out["https"] = bool(lov["https"])
         if lov.get("action_mode") in ("All", "Vibrate"):
             lov_out["action_mode"] = lov["action_mode"]
+        if lov.get("story_drive_mode") in ("stream", "pattern"):
+            lov_out["story_drive_mode"] = lov["story_drive_mode"]
         if "use_time_sec_safety" in lov:
             lov_out["use_time_sec_safety"] = bool(lov["use_time_sec_safety"])
         if lov_out:

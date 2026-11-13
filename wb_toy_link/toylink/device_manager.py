@@ -68,7 +68,8 @@ class DeviceManager:
         self._task: asyncio.Task | None = None
         self._io_tasks: set[asyncio.Task] = set()
 
-        # Gapless hardware-loop stream tracking
+        # Gapless hardware-loop & live-stream tracking
+        self._live_stream_active: bool = False
         self._pattern_stream_active: bool = False
         self._sent_mode_key: tuple | None = None
         self._sent_pattern: str = ""
@@ -82,6 +83,8 @@ class DeviceManager:
         self._active_interval_ms: int = 150
         self._active_started_at: float = 0.0
         self._active_u0: float = 0.0
+        self._active_cue_id: object = None
+        self._cue_entry_strength: float = 0.0
 
         # Conflict-free preview state (seconds <= 0 => loop until stopped)
         self._preview_id: int = 0
@@ -121,6 +124,46 @@ class DeviceManager:
             return max(0.0, float(cfg["ramp_ms"]))
         feel = str(cfg.get("response_feel", "natural"))
         return RESPONSE_FEEL_RAMP_MS.get(feel, 420.0)
+
+    def _compute_sentence_target(self, base_target: float, now: float) -> float:
+        """Continuous C0/C1 sentence envelope anchored to live entry strength (zero boundary drops)."""
+        if base_target <= 0.5 or not self.vibe.params.get("sentence_cue") or self.vibe.pattern == "afterglow":
+            self._active_cue_id = None
+            return base_target
+
+        cue_id = self.vibe.params.get("cue_id")
+        if cue_id != self._active_cue_id:
+            self._active_cue_id = cue_id
+            self._cue_entry_strength = self.envelope
+
+        elapsed_cue = max(0.0, now - self.vibe.latched_at)
+        cue_dur = max(1.3, float(self.vibe.params.get("duration_s") or 3.4))
+        p = min(1.0, elapsed_cue / cue_dur)
+        s_curve = 0.5 - 0.5 * math.cos(math.pi * p)
+        arc = normalize_arc(self.vibe.params.get("arc"))
+        entry_s = self._cue_entry_strength
+
+        if arc == "rise":
+            start_s = entry_s if entry_s > 2.0 else (base_target * 0.74)
+            if base_target >= start_s * 0.92:
+                end_s = min(100.0, max(base_target * 1.05, start_s + min(7.0, base_target * 0.09)))
+            else:
+                end_s = min(100.0, base_target * 1.04)
+            return min(100.0, max(0.0, start_s + (end_s - start_s) * s_curve))
+
+        if arc == "surge":
+            start_s = entry_s if entry_s > 2.0 else (base_target * 0.80)
+            base_glide = start_s + (base_target - start_s) * s_curve
+            peak_s = min(100.0, max(base_target, start_s) * 1.12)
+            crest_bump = max(0.0, peak_s - max(start_s, base_target)) + 0.08 * base_target
+            return min(100.0, max(0.0, base_glide + crest_bump * math.sin(math.pi * (p ** 0.85))))
+
+        if arc == "ease":
+            start_s = entry_s if entry_s > 2.0 else base_target
+            end_s = base_target * 0.84
+            return min(100.0, max(0.0, start_s + (end_s - start_s) * s_curve))
+
+        return base_target
 
     def _preview_feather(self, remaining_s: float) -> float:
         if self._preview_loop:
@@ -171,16 +214,12 @@ class DeviceManager:
                 self._preview_envelope = 0.0
 
             base_target = self.vibe.strength if self.vibe.vibe_on else 0.0
-            if base_target > 0.5 and self.vibe.params.get("sentence_cue") and self.vibe.pattern != "afterglow":
-                elapsed_cue = max(0.0, now - self.vibe.latched_at)
-                cue_dur = max(1.3, float(self.vibe.params.get("duration_s") or 3.4))
-                arc_mult = sentence_arc_gain(self.vibe.params.get("arc"), min(1.0, elapsed_cue / cue_dur))
-                target = min(100.0, base_target * arc_mult)
-            else:
-                target = base_target
+            target = self._compute_sentence_target(base_target, now)
 
             if not self.vibe.vibe_on:
                 self.envelope = 0.0
+                self._active_cue_id = None
+                self._cue_entry_strength = 0.0
             elif self.vibe.pattern == "afterglow" and self.envelope > target and target > 0.0:
                 self.envelope = target
             else:
@@ -243,10 +282,28 @@ class DeviceManager:
         contrast_mode: str,
         background_io: bool,
     ) -> None:
-        pattern_clients = [c for c in self.clients if getattr(c, "supports_pattern_stream", False)]
-        direct_clients = [c for c in self.clients if not getattr(c, "supports_pattern_stream", False)]
+        if in_preview:
+            live_stream_clients = []
+            pattern_clients = [c for c in self.clients if getattr(c, "supports_pattern_stream", False)]
+            direct_clients = [c for c in self.clients if c not in pattern_clients]
+        else:
+            live_stream_clients = [
+                c
+                for c in self.clients
+                if getattr(c, "prefers_live_story_stream", False) and hasattr(c, "send_live_level")
+            ]
+            pattern_clients = [
+                c
+                for c in self.clients
+                if c not in live_stream_clients and getattr(c, "supports_pattern_stream", False)
+            ]
+            direct_clients = [
+                c
+                for c in self.clients
+                if c not in live_stream_clients and c not in pattern_clients
+            ]
 
-        # 1. Direct step clients (unit-test FakeClient or Function-mode fallback)
+        # 1. Direct step clients (unit-test FakeClient or legacy Function fallback)
         if direct_clients:
             if level <= 0.0005:
                 if self._last_sent > 0.0:
@@ -257,7 +314,31 @@ class DeviceManager:
                 self._last_send_time = now
                 await self._run_clients([c.set_level(level) for c in direct_clients], background_io)
 
-        # 2. Gapless Lovense Pattern-stream clients
+        # 2. Seamless Live-Stream Story clients (`Function` stopPrevious=0, timeSec=0 -> zero BLE pattern resets)
+        if live_stream_clients:
+            target_on = self.vibe.vibe_on and self.vibe.strength > 0.5
+            if not target_on and self.envelope <= 0.2 and level <= 0.0005:
+                if self._live_stream_active or self._pattern_stream_active:
+                    self._live_stream_active = False
+                    if not pattern_clients:
+                        self._pattern_stream_active = False
+                        self._sent_mode_key = None
+                        self._sent_eff_norm = -1.0
+                        self._clear_active_phrase()
+                    await self._run_clients([c.stop() for c in live_stream_clients], background_io)
+            elif target_on or self.envelope > 0.2 or level > 0.0005:
+                if not pattern_clients and self._pattern_stream_active:
+                    self._pattern_stream_active = False
+                    self._sent_mode_key = None
+                    self._clear_active_phrase()
+                self._live_stream_active = True
+                allow_valley = bool(target_on and self.envelope > 1.0)
+                await self._run_clients(
+                    [c.send_live_level(level, allow_zero_valley=allow_valley) for c in live_stream_clients],
+                    background_io,
+                )
+
+        # 3. Gapless Lovense Pattern-stream clients (Toy Studio previews + optional Hardware Loop mode)
         if not pattern_clients:
             return
 
@@ -542,6 +623,7 @@ class DeviceManager:
                 await coro
 
     async def _send_stop(self) -> None:
+        self._live_stream_active = False
         self._pattern_stream_active = False
         self._sent_mode_key = None
         self._sent_eff_norm = -1.0
@@ -578,6 +660,7 @@ class DeviceManager:
         self._preview_vibe = pv
         self._preview_pattern_def = pv._pattern_def
         self._preview_envelope = min(self.envelope, pv.strength)
+        self._live_stream_active = False
         sec = float(seconds or 0.0)
         if sec <= 0.0:
             self._preview_loop = True
@@ -601,6 +684,8 @@ class DeviceManager:
         self._preview_seconds = 0.0
         self._preview_until = 0.0
         self._preview_envelope = 0.0
+        self._active_cue_id = None
+        self._cue_entry_strength = 0.0
         self.vibe.clear(source="manual")
         self.envelope = 0.0
         self.current_level = 0.0
@@ -615,6 +700,8 @@ class DeviceManager:
             self._preview_pattern_def = None
             self._preview_loop = False
             self._preview_until = 0.0
+            self._active_cue_id = None
+            self._cue_entry_strength = 0.0
             self.envelope = 0.0
             self.current_level = 0.0
             self._last_sent = 0.0

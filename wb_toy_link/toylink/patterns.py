@@ -22,7 +22,7 @@ import time
 
 TAU = 2.0 * math.pi
 PHI = 1.618033988749895
-XFADE_S = 0.35
+XFADE_S = 0.45
 AFTERGLOW_DECAY_S = 9.5
 
 PATTERN_SPECS: dict[str, dict] = {
@@ -1181,6 +1181,7 @@ class VibeState:
         self.phrase_phase: float = 0.0
         self.contrast_phase: float = 0.0
         self._prev_pattern: str | None = None
+        self._prev_carrier: float = 0.0
         self._xfade: float = 1.0
         self._afterglow_start_strength: float = 0.0
         self._pattern_def: dict | None = None
@@ -1191,6 +1192,98 @@ class VibeState:
         if self._pattern_def is not None:
             dup._pattern_def = copy.deepcopy(self._pattern_def)
         return dup
+
+    def _eval_oscillator(
+        self,
+        pat: str,
+        phase: float,
+        phrase_phase: float,
+        contrast_phase: float,
+        pace: float,
+        intensity_norm: float,
+        c_gain: float,
+        contrast_mode: str,
+        explicit_def: dict | None = None,
+    ) -> float:
+        custom_spec = explicit_def if (explicit_def and explicit_def.get("id") == pat) else get_custom_or_override_spec(pat)
+        if custom_spec is not None:
+            return eval_block_pattern(
+                custom_spec,
+                phase % 1.0,
+                intensity_norm=intensity_norm,
+                contrast_mode=contrast_mode,
+            )
+        return _eval_single(
+            pat,
+            phase,
+            phrase_phase,
+            contrast_phase,
+            intensity_norm,
+            pace,
+            c_gain,
+        )
+
+    def _current_carrier_instant(self, intensity_norm: float = 0.65, contrast_mode: str = "balanced") -> float:
+        c_gain = CONTRAST_MODES.get(contrast_mode, 1.0)
+        cur = self._eval_oscillator(
+            self.pattern,
+            self.phase,
+            self.phrase_phase,
+            self.contrast_phase,
+            self.pace,
+            intensity_norm,
+            c_gain,
+            contrast_mode,
+            self._pattern_def,
+        )
+        if self._prev_pattern is not None and self._xfade < 1.0:
+            blend = 0.5 - 0.5 * math.cos(math.pi * _clamp(self._xfade))
+            return _clamp(self._prev_carrier * (1.0 - blend) + cur * blend)
+        return cur
+
+    def _align_incoming_phase(
+        self,
+        new_pat: str,
+        new_pace: float,
+        clean_def: dict | None,
+        target_carrier: float,
+        intensity_norm: float,
+    ) -> float:
+        """Choose incoming oscillator phase matching `target_carrier` on a non-falling slope."""
+        custom_spec = clean_def or get_custom_or_override_spec(new_pat)
+        c_gain = 1.0
+        span = 1.0 if custom_spec is not None else (8.0 if new_pat == "tease" else (4.0 if new_pat == "rhythm" else 1.0))
+        samples = 32
+        vals = [
+            self._eval_oscillator(
+                new_pat,
+                (k / samples) * span,
+                self.phrase_phase,
+                self.contrast_phase,
+                new_pace,
+                intensity_norm,
+                c_gain,
+                "balanced",
+                clean_def,
+            )
+            for k in range(samples)
+        ]
+        max_v = max(vals) if vals else 0.0
+        has_nonzero = max_v >= 0.05
+        best_idx = 0
+        best_cost = 1e9
+        for k, v in enumerate(vals):
+            nxt = vals[(k + 1) % samples]
+            slope = nxt - v
+            cost = abs(v - target_carrier)
+            if has_nonzero and v < 0.04:
+                cost += 0.60
+            if slope < -0.01:
+                cost += 0.08
+            if cost < best_cost:
+                best_cost = cost
+                best_idx = k
+        return (best_idx / samples) * span
 
     def set_target(
         self,
@@ -1219,10 +1312,21 @@ class VibeState:
             self.phrase_phase = 0.0
             self.contrast_phase = 0.0
             self._prev_pattern = None
+            self._prev_carrier = 0.0
             self._xfade = 1.0
-        elif new_pat != self.pattern and not was_silent:
+        elif new_pat != self.pattern and not was_silent and new_strength > 0.5:
+            live_i = _clamp(self.strength / 100.0, 0.1, 1.0)
+            live_w = self._current_carrier_instant(intensity_norm=live_i)
             self._prev_pattern = self.pattern
+            self._prev_carrier = live_w
             self._xfade = 0.0
+            self.phase = self._align_incoming_phase(
+                new_pat,
+                new_pace,
+                clean_def,
+                target_carrier=live_w,
+                intensity_norm=_clamp(new_strength / 100.0, 0.1, 1.0),
+            )
 
         self.strength = new_strength
         self.pattern = new_pat
@@ -1248,6 +1352,7 @@ class VibeState:
     def clear(self, source: str = "stop") -> None:
         self.strength = 0.0
         self._prev_pattern = None
+        self._prev_carrier = 0.0
         self._xfade = 1.0
         self._pattern_def = None
         self.latched_at = self._clock()
@@ -1258,25 +1363,6 @@ class VibeState:
         if self.vibe_on != bool(on):
             self.vibe_on = bool(on)
             self.version += 1
-
-    def _eval_pat_instant(self, pat: str, intensity_norm: float, c_gain: float, contrast_mode: str) -> float:
-        custom_spec = self._pattern_def if (self._pattern_def and pat == self.pattern) else get_custom_or_override_spec(pat)
-        if custom_spec is not None:
-            return eval_block_pattern(
-                custom_spec,
-                self.phase % 1.0,
-                intensity_norm=intensity_norm,
-                contrast_mode=contrast_mode,
-            )
-        return _eval_single(
-            pat,
-            self.phase,
-            self.phrase_phase,
-            self.contrast_phase,
-            intensity_norm,
-            self.pace,
-            c_gain,
-        )
 
     def _step_once(
         self,
@@ -1296,11 +1382,21 @@ class VibeState:
         thresh = 0.52 if c_gain > 1.1 else 0.62
         hi_blend = _clamp(_clamp((intensity_norm - thresh) / max(0.15, 1.0 - thresh)) * c_gain)
 
-        cur = self._eval_pat_instant(self.pattern, intensity_norm, c_gain, contrast_mode)
+        cur = self._eval_oscillator(
+            self.pattern,
+            self.phase,
+            self.phrase_phase,
+            self.contrast_phase,
+            self.pace,
+            intensity_norm,
+            c_gain,
+            contrast_mode,
+            self._pattern_def,
+        )
 
         if self._prev_pattern is not None and self._xfade < 1.0:
-            prev = self._eval_pat_instant(self._prev_pattern, intensity_norm, c_gain, contrast_mode)
-            w = prev * (1.0 - self._xfade) + cur * self._xfade
+            blend = 0.5 - 0.5 * math.cos(math.pi * _clamp(self._xfade))
+            w = self._prev_carrier * (1.0 - blend) + cur * blend
             if dt > 0.0:
                 self._xfade = min(1.0, self._xfade + dt / XFADE_S)
                 if self._xfade >= 1.0:

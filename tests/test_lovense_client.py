@@ -179,3 +179,50 @@ async def test_send_pattern_falls_back_to_function_if_bridge_rejects_pattern():
     assert sent[-1]["command"] == "Function"
     assert sent[-1]["action"] == "All:10"
 
+
+async def test_send_live_level_uses_stop_previous_zero_and_paces_ble_slots():
+    client, requests, _, clock = make_client()
+
+    # First live step starts immediately with stopPrevious=0, timeSec=0
+    await client.send_live_level(0.50)  # step 10
+    assert requests == [
+        {"command": "Function", "action": "All:10", "timeSec": 0, "stopPrevious": 0, "apiVer": 1}
+    ]
+
+    # Holding the same step does NOT spam 0.85s keepalive packets
+    clock.t += 3.0
+    await client.send_live_level(0.51)  # still step 10
+    assert len(requests) == 1
+
+    # Step change paces to 110ms BLE slot and delivers latest step on eligible tick
+    await client.send_live_level(0.60)  # step 12 -> sends now
+    assert len(requests) == 2
+    assert requests[-1]["action"] == "All:12"
+    assert requests[-1]["stopPrevious"] == 0
+
+    clock.t += 0.05  # < 110ms -> coalesced
+    await client.send_live_level(0.70)
+    assert len(requests) == 2
+
+    clock.t += 0.07  # >= 110ms -> sends newest step (15)
+    await client.send_live_level(0.75)
+    assert len(requests) == 3
+    assert requests[-1]["action"] == "All:15"
+
+    # Switching directly out of a hardware Pattern loop sends stopPrevious=1 once, then 0
+    await client.send_pattern([0.5, 0.6, 0.7], interval_ms=130, loop=True)
+    assert requests[-1]["command"] == "Pattern"
+    clock.t += 0.2
+    await client.send_live_level(0.65)
+    assert requests[-1] == {
+        "command": "Function",
+        "action": "All:13",
+        "timeSec": 0,
+        "stopPrevious": 1,
+        "apiVer": 1,
+    }
+    clock.t += 0.2
+    await client.send_live_level(0.70)
+    assert requests[-1]["stopPrevious"] == 0
+
+

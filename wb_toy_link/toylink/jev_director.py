@@ -503,6 +503,22 @@ def interpret_answers(
     else:
         raw_pat = str(pat_ans.get("choice") or "")
         chosen_pat = raw_pat if raw_pat in allowed else allowed[0]
+        pat_probs = pat_ans.get("probabilities") if pat_ans.get("type") == "choice" else None
+        # Pattern continuity hysteresis: avoid flip-flopping waveforms on marginal
+        # probability ties mid-scene, while switching cleanly when action shifts.
+        if (
+            current_strength > 10.0
+            and current_pattern in allowed
+            and current_pattern != "afterglow"
+            and chosen_pat != current_pattern
+            and chosen_pat != "afterglow"
+            and isinstance(pat_probs, dict)
+            and abs(scaled_strength - current_strength) < 22.0
+        ):
+            p_new = float(pat_probs.get(chosen_pat, 0.0))
+            p_cur = float(pat_probs.get(current_pattern, 0.0))
+            if p_cur >= 0.18 and (p_new - p_cur) < 0.14:
+                chosen_pat = current_pattern
         # Guard against accidental decay to 0 during an energetic active scene
         if chosen_pat == "afterglow" and scaled_strength > 55.0 and p_wind < 0.35:
             chosen_pat = "swell" if "swell" in allowed else allowed[0]
@@ -938,11 +954,21 @@ class JevDirector:
     async def _evaluate(self, seq: int, narration: str, step: str) -> None:
         enabled_patterns = self._enabled_patterns()
         questions = build_questions(enabled_patterns)
+        cur_vibe = (self._get_current_vibe() or {}) if self._get_current_vibe else {}
+        cur_strength = float(cur_vibe.get("strength", self._get_current_strength()))
+        cur_pattern = normalize_pattern(cur_vibe.get("pattern") or "velvet")
+        cur_pace = float(cur_vibe.get("pace", 0.45))
         state_payload = {
             "recent_story": self._recent_story,
             "player_action": self._player_action,
             "current_narration": narration,
-            "current_haptic_strength": round(float(self._get_current_strength()), 1),
+            "current_haptic_strength": round(cur_strength, 1),
+            "active_haptic_state": {
+                "active": cur_strength > 5.0 and cur_pattern != "afterglow",
+                "strength": round(cur_strength, 1),
+                "pattern": cur_pattern,
+                "pace": round(cur_pace, 2),
+            },
         }
         decision = None
         try:
@@ -965,9 +991,11 @@ class JevDirector:
             verdict = interpret_answers(
                 answers,
                 enabled_patterns=enabled_patterns,
-                current_strength=float(self._get_current_strength()),
+                current_strength=cur_strength,
                 sensitivity=sensitivity,
                 pattern_override=self.pattern_override,
+                current_pattern=cur_pattern,
+                current_pace=cur_pace,
             )
             self.last_verdict = verdict
             self.last_error = ""
