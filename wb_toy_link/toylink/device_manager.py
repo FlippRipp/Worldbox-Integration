@@ -20,6 +20,7 @@ import time
 from .patterns import (
     PATTERN_SPECS,
     VibeState,
+    afterglow_has_custom_nonzero_floor,
     all_pattern_specs,
     build_lovense_phrase,
     build_lovense_phrase_with_phase,
@@ -31,6 +32,8 @@ from .patterns import (
 KEEPALIVE_S = 0.85
 MIN_CHANGE_RESEND_S = 0.12              # coalesce rapid manual slider drags
 MIN_SAME_PATTERN_RESEND_S = 0.35        # avoid double-tapping BLE on same-pattern nudges
+LOOP_DEADBAND_NORM = 0.13               # ~2.6/20 Lovense steps: keep loop untouched on minor shifts
+LOOP_PACE_DEADBAND = 0.22
 PREVIEW_RAMP_MS = 350.0
 PREVIEW_RELEASE_S = 0.80
 
@@ -413,8 +416,13 @@ class DeviceManager:
                 await self._run_clients([c.stop() for c in pattern_clients], background_io)
             return
 
-        if self.vibe.pattern == "afterglow":
-            # One-shot 9.5s wind-down: send ONCE per latch, never refresh mid-decay
+        one_shot_afterglow = (
+            self.vibe.pattern == "afterglow"
+            and not self.vibe.params.get("loop_afterglow")
+            and not afterglow_has_custom_nonzero_floor()
+        )
+        if one_shot_afterglow:
+            # Default unedited wind-down: send ONCE per latch, never refresh mid-decay
             start_i = self.vibe._afterglow_start_strength or target
             eff_norm = max(0.0, min(1.0, (start_i / 100.0) * cap))
             mode_key = ("afterglow", round(self.vibe.latched_at, 3), round(cap, 3), contrast_mode)
@@ -445,137 +453,21 @@ class DeviceManager:
             )
             return
 
-        # Shaped per-sentence Stage cue: phase-aligned + output-bridged with zero unnecessary resets
-        base_eff_norm = max(0.0, min(1.0, (self.vibe.strength / 100.0) * cap))
+        # Always-Looping Hardware State (`timeSec: 0`, `periodic_only=True`):
+        # Every packet sent to Lovense is immediately a closed periodic loop with
+        # phase-matched entry rotation — zero finite buffers, zero ~4.3s mid-sentence
+        # settle reloads, and deadband coalescing across consecutive sentences.
+        eff_norm = max(0.0, min(1.0, (self.vibe.strength / 100.0) * cap))
         same_pat = bool(self._pattern_stream_active and self._sent_pattern == self.vibe.pattern)
-
-        if self.vibe.params.get("sentence_cue") and self.vibe.pattern != "afterglow":
-            cue_id = self.vibe.params.get("cue_id")
-            arc = normalize_arc(self.vibe.params.get("arc"))
-            dur_s = max(1.3, float(self.vibe.params.get("duration_s") or 3.4))
-            cue_key = ("sentence", cue_id, round(cap, 3), contrast_mode)
-            settled_key = ("sentence_settled", cue_id, round(cap, 3), contrast_mode)
-            end_eff = max(0.0, min(1.0, base_eff_norm * sentence_arc_gain(arc, 1.0)))
-
-            if self._pattern_stream_active and self._sent_mode_key == settled_key:
-                return
-
-            if self._pattern_stream_active and self._sent_mode_key == cue_key:
-                if (now - self._last_pattern_send_at) < self._sentence_settle_after_s:
-                    return
-                # Sentence held past shaped contour window: settle once at exact live hardware phase
-                levels, interval_ms, _, u0 = build_lovense_phrase_with_phase(
-                    self.vibe.pattern,
-                    intensity_norm=end_eff,
-                    pace=self.vibe.pace,
-                    contrast_mode=contrast_mode,
-                    loop=True,
-                    entry_norm=live_lv,
-                    live_phase=live_u,
-                    same_pattern=True,
-                )
-                self._sent_mode_key = settled_key
-                self._sent_pattern = self.vibe.pattern
-                self._sent_eff_norm = end_eff
-                self._sent_pace = self.vibe.pace
-                self._sent_arc = "steady"
-                self._last_pattern_send_at = now
-                self._loop_needs_settle = False
-                self._record_active_phrase(levels, interval_ms, now, u0)
-                await self._run_clients(
-                    [c.send_pattern(levels, interval_ms=interval_ms, loop=True) for c in pattern_clients],
-                    background_io,
-                )
-                return
-
-            if (
-                same_pat
-                and arc in ("steady", "ease")
-                and abs(end_eff - self._sent_eff_norm) < 0.055
-                and abs(self.vibe.pace - self._sent_pace) < 0.14
-            ):
-                # Pattern & strength already match within ~1 Lovense step: keep hardware loop untouched!
-                already_clean = (
-                    self._sent_mode_key is not None
-                    and self._sent_mode_key[0] in ("loop", "sentence_settled")
-                    and not self._loop_needs_settle
-                )
-                self._sent_mode_key = settled_key if already_clean else cue_key
-                return
-
-            entry_lv = (
-                live_lv
-                if (self._pattern_stream_active and live_lv is not None)
-                else max(0.0, min(1.0, (self.envelope / 100.0) * cap))
-            )
-            levels, interval_ms, _, u0 = build_lovense_phrase_with_phase(
-                self.vibe.pattern,
-                intensity_norm=base_eff_norm,
-                pace=self.vibe.pace,
-                contrast_mode=contrast_mode,
-                loop=True,
-                entry_norm=entry_lv,
-                arc=arc,
-                duration_s=dur_s,
-                live_phase=live_u,
-                same_pattern=same_pat,
-            )
-            needs_settle = abs(levels[0] - levels[-1]) > 0.10
-            self._pattern_stream_active = True
-            self._sent_mode_key = cue_key if needs_settle else settled_key
-            self._sent_pattern = self.vibe.pattern
-            self._sent_eff_norm = end_eff
-            self._sent_pace = self.vibe.pace
-            self._sent_arc = arc
-            self._last_pattern_send_at = now
-            self._loop_needs_settle = needs_settle
-            self._sentence_settle_after_s = max(2.2, ((len(levels) * interval_ms) / 1000.0) * 0.86)
-            self._record_active_phrase(levels, interval_ms, now, u0)
-            await self._run_clients(
-                [c.send_pattern(levels, interval_ms=interval_ms, loop=True) for c in pattern_clients],
-                background_io,
-            )
-            return
-
-        # Steady continuous / Classic Feed pattern: loop natively in hardware (timeSec: 0)
-        eff_norm = base_eff_norm
-        mode_key = ("loop", self.vibe.pattern, contrast_mode)
-
-        # If an entry-feathered steady loop was held past its phrase window, settle cleanly once
-        if (
-            self._pattern_stream_active
-            and mode_key == self._sent_mode_key
-            and self._loop_needs_settle
-            and (now - self._last_pattern_send_at) >= self._sentence_settle_after_s
-            and abs(eff_norm - self._sent_eff_norm) < 0.055
-        ):
-            levels, interval_ms, _, u0 = build_lovense_phrase_with_phase(
-                self.vibe.pattern,
-                intensity_norm=eff_norm,
-                pace=self.vibe.pace,
-                contrast_mode=contrast_mode,
-                loop=True,
-                live_phase=live_u,
-                same_pattern=True,
-            )
-            self._loop_needs_settle = False
-            self._last_pattern_send_at = now
-            self._record_active_phrase(levels, interval_ms, now, u0)
-            await self._run_clients(
-                [c.send_pattern(levels, interval_ms=interval_ms, loop=True) for c in pattern_clients],
-                background_io,
-            )
-            return
+        mode_key = ("loop", self.vibe.pattern, round(cap, 3), contrast_mode)
 
         same_loop = (
             same_pat
-            and self._sent_mode_key is not None
-            and self._sent_mode_key[0] in ("loop", "sentence_settled")
-            and abs(eff_norm - self._sent_eff_norm) < 0.055
-            and abs(self.vibe.pace - self._sent_pace) < 0.15
+            and self._sent_mode_key == mode_key
+            and abs(eff_norm - self._sent_eff_norm) < LOOP_DEADBAND_NORM
+            and abs(self.vibe.pace - self._sent_pace) < LOOP_PACE_DEADBAND
         )
         if same_loop:
-            self._sent_mode_key = mode_key
             return
 
         min_gap = MIN_SAME_PATTERN_RESEND_S if same_pat else MIN_CHANGE_RESEND_S
@@ -592,8 +484,8 @@ class DeviceManager:
             entry_norm=entry_lv,
             live_phase=live_u,
             same_pattern=same_pat,
+            periodic_only=True,
         )
-        needs_settle = bool(entry_lv is not None and abs(levels[0] - levels[-1]) > 0.12)
         self._pattern_stream_active = True
         self._sent_mode_key = mode_key
         self._sent_pattern = self.vibe.pattern
@@ -601,8 +493,7 @@ class DeviceManager:
         self._sent_pace = self.vibe.pace
         self._sent_arc = "steady"
         self._last_pattern_send_at = now
-        self._loop_needs_settle = needs_settle
-        self._sentence_settle_after_s = max(2.2, ((len(levels) * interval_ms) / 1000.0) * 0.86)
+        self._loop_needs_settle = False
         self._record_active_phrase(levels, interval_ms, now, u0)
         await self._run_clients(
             [
@@ -637,6 +528,7 @@ class DeviceManager:
         """Force Lovense stream refresh if the edited pattern is actively playing."""
         if pattern_id is None or self._sent_pattern == pattern_id or self.vibe.pattern == pattern_id:
             self._sent_mode_key = None
+            self._sent_eff_norm = -1.0
             self._last_pattern_send_at = -999.0
 
     def start_preview(

@@ -20,7 +20,7 @@ DEFAULT_CONFIG: dict = {
         "port": 20010,
         "https": False,
         "action_mode": "All",          # "All" (all actuators) | "Vibrate"
-        "story_drive_mode": "stream",  # "stream" (zero-gap live crossfade) | "pattern" (hardware loop)
+        "story_drive_mode": "loop",    # "loop" (resilient infinite hardware loop) | "live_stream"
         "use_time_sec_safety": True,
     },
     "master_cap_global": 100,
@@ -98,6 +98,9 @@ class ConfigStore:
         if merged.get("between_blocks") not in ("continue", "low", "stop"):
             merged["between_blocks"] = "stop" if merged.get("stop_on_turn_end") else "continue"
         merged["stop_on_turn_end"] = merged["between_blocks"] == "stop"
+        lov_merged = merged.get("lovense")
+        if isinstance(lov_merged, dict) and lov_merged.get("story_drive_mode") not in ("loop", "live_stream"):
+            lov_merged["story_drive_mode"] = "loop"
         return merged
 
     def config(self) -> dict:

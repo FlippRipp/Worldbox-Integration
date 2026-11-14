@@ -566,6 +566,17 @@ def get_custom_or_override_spec(pattern: str, user_patterns: dict | None = None)
     return sanitize_block_pattern(up[pattern], fallback_id=pattern)
 
 
+def afterglow_has_custom_nonzero_floor(user_patterns: dict | None = None) -> bool:
+    """Return True when the user customized `afterglow` with a non-zero base floor."""
+    spec = get_custom_or_override_spec("afterglow", user_patterns=user_patterns)
+    if spec is None:
+        return False
+    blocks = spec.get("blocks") or []
+    if not blocks:
+        return False
+    return min(float(b.get("floor", 0.0)) for b in blocks) > 0.01
+
+
 def normalize_arc(arc: str | None) -> str:
     if not arc:
         return "steady"
@@ -840,6 +851,7 @@ def build_lovense_phrase_with_phase(
     pattern_def: dict | None = None,
     live_phase: float | None = None,
     same_pattern: bool = False,
+    periodic_only: bool = False,
 ) -> tuple[list[float], int, bool, float]:
     """Synthesize a Lovense ``Pattern`` phrase + starting normalized phase ``u0``."""
     custom_spec = (
@@ -901,7 +913,7 @@ def build_lovense_phrase_with_phase(
             unit_steps = unit_steps[rot_k:] + unit_steps[:rot_k]
         phase_u0 = (rot_k / n) % 1.0
 
-        shaped_sentence = (clamped_entry is not None) or (use_arc != "steady")
+        shaped_sentence = (not periodic_only) and ((clamped_entry is not None) or (use_arc != "steady"))
         phrase_dur_s = (n * interval_ms) / 1000.0
         win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
         ramp_s = 0.65
@@ -1020,8 +1032,8 @@ def build_lovense_phrase_with_phase(
         unit_weights = unit_weights[rot_k:] + unit_weights[:rot_k]
     phase_u0 = (rot_k / n) % 1.0
 
-    # 3. Apply sentence arc & true output-level crossfade from live motor level
-    shaped_sentence = (clamped_entry is not None) or (use_arc != "steady")
+    # 3. Apply sentence arc & true output-level crossfade from live motor level (unless pure periodic loop)
+    shaped_sentence = (not periodic_only) and ((clamped_entry is not None) or (use_arc != "steady"))
     phrase_dur_s = (n * interval_ms) / 1000.0
     win_s = max(1.3, min(phrase_dur_s * 0.85, float(duration_s or 3.4)))
     ramp_s = 0.65
@@ -1061,6 +1073,7 @@ def build_lovense_phrase(
     pattern_def: dict | None = None,
     live_phase: float | None = None,
     same_pattern: bool = False,
+    periodic_only: bool = False,
 ) -> tuple[list[float], int, bool]:
     """Synthesize a Lovense ``Pattern`` phrase: ``(levels, interval_ms, is_loop)``."""
     levels, interval_ms, is_loop, _ = build_lovense_phrase_with_phase(
@@ -1076,6 +1089,7 @@ def build_lovense_phrase(
         pattern_def=pattern_def,
         live_phase=live_phase,
         same_pattern=same_pattern,
+        periodic_only=periodic_only,
     )
     return levels, interval_ms, is_loop
 
@@ -1105,7 +1119,7 @@ def sample_pattern_curve(
         for idx in range(steps):
             t = (idx / max(1, steps - 1)) * win_s
             u = (t / loop_s) % 1.0
-            if custom_spec["id"] == "afterglow":
+            if custom_spec["id"] == "afterglow" and not afterglow_has_custom_nonzero_floor():
                 env = max(0.0, 1.0 - (t / AFTERGLOW_DECAY_S))
             else:
                 env = 1.0
@@ -1372,7 +1386,15 @@ class VibeState:
         contrast_mode: str = "balanced",
         auto_decay: bool = True,
     ) -> float:
-        if auto_decay and self.pattern == "afterglow" and self.strength > 0.0 and dt > 0.0:
+        should_decay_afterglow = (
+            auto_decay
+            and self.pattern == "afterglow"
+            and self.strength > 0.0
+            and dt > 0.0
+            and not self.params.get("loop_afterglow")
+            and not afterglow_has_custom_nonzero_floor()
+        )
+        if should_decay_afterglow:
             rate = max(6.0, self._afterglow_start_strength or 50.0) / AFTERGLOW_DECAY_S
             self.strength = max(0.0, self.strength - rate * dt)
             if self.strength == 0.0:

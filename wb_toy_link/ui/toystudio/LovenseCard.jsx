@@ -159,13 +159,13 @@ export default function LovenseCard({ config, saveConfig, status, api, refresh }
                 ]}
               />
             </Field>
-            <Field label="Story transitions" hint="Seamless crossfades with zero pattern-reload gaps">
+            <Field label="Story transitions" hint="Infinite on-toy loop (TTS-resilient) or live 9Hz stream">
               <Segmented
-                value={lovCfg.story_drive_mode || 'stream'}
+                value={lovCfg.story_drive_mode === 'live_stream' ? 'live_stream' : 'loop'}
                 onChange={(v) => saveConfig({ lovense: { story_drive_mode: v } })}
                 options={[
-                  { id: 'stream', label: 'Seamless Stream' },
-                  { id: 'pattern', label: 'Hardware Loop' },
+                  { id: 'loop', label: 'Hardware Loop' },
+                  { id: 'live_stream', label: 'Live Stream' },
                 ]}
               />
             </Field>

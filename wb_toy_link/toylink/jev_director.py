@@ -416,7 +416,7 @@ def interpret_answers(
     if p_engaged < 0.45:
         if p_wind >= 0.45 and current_strength > 8.0 and "afterglow" in allowed:
             pat = normalize_pattern(pattern_override) if pattern_override else "afterglow"
-            return {
+            out = {
                 "action": "apply",
                 "strength": round(min(max(current_strength, 24.0), 48.0), 1),
                 "pattern": pat,
@@ -425,11 +425,14 @@ def interpret_answers(
                 "engaged": round(p_engaged, 3),
                 "wind_down": round(p_wind, 3),
             }
+            if sentence_mode:
+                out["params"] = {"loop_afterglow": True}
+            return out
 
-        if sentence_mode and current_strength > 8.0 and current_pattern != "afterglow":
-            # Explicit disengagement or 2+ prior low-engagement sentences -> step down cleanly
-            explicit_stop = p_engaged <= 0.12 and p_wind >= 0.28
-            sustained_shift = low_engagement_streak >= 2 and p_engaged <= 0.24
+        if sentence_mode and current_strength > 8.0:
+            # Explicit interruption/disengagement or 4+ prior non-engaged sentences -> step down cleanly
+            explicit_stop = p_engaged <= 0.06 and p_wind >= 0.30
+            sustained_shift = low_engagement_streak >= 4 and p_engaged <= 0.18
             if explicit_stop or sustained_shift:
                 return {
                     "action": "apply",
@@ -441,13 +444,14 @@ def interpret_answers(
                     "wind_down": round(p_wind, 3),
                 }
             # Mid-scene dialogue, eye contact, or atmospheric sentence: preserve
-            # the active vibration with a gentle softening rather than cutting to 0%.
+            # the active loop on a warm simmer floor (~20%) rather than cutting to 0%.
             keep_pat = normalize_pattern(pattern_override or current_pattern)
             if not pattern_override and keep_pat not in allowed:
                 keep_pat = allowed[0]
-            eased_strength = round(max(14.0, current_strength * 0.86), 1)
-            eased_pace = round(max(0.15, min(1.0, float(current_pace) * 0.90)), 2)
-            return {
+            simmer_floor = 20.0 if current_strength >= 20.0 else 14.0
+            eased_strength = round(max(simmer_floor, current_strength * 0.86), 1)
+            eased_pace = round(max(0.18, min(1.0, float(current_pace) * 0.92)), 2)
+            hold_out = {
                 "action": "apply",
                 "strength": eased_strength,
                 "pattern": keep_pat,
@@ -457,6 +461,9 @@ def interpret_answers(
                 "engaged": round(p_engaged, 3),
                 "wind_down": round(p_wind, 3),
             }
+            if keep_pat == "afterglow":
+                hold_out["params"] = {"loop_afterglow": True}
+            return hold_out
 
         if p_engaged <= 0.15:
             return {
@@ -776,7 +783,7 @@ class JevDirector:
             self._simulated_strength = float(verdict.get("strength", 0.0))
             self._simulated_pattern = normalize_pattern(verdict.get("pattern") or self._simulated_pattern)
             self._simulated_pace = float(verdict.get("pace", self._simulated_pace))
-            if self._simulated_strength <= 0.5 or self._simulated_pattern == "afterglow":
+            if self._simulated_strength <= 0.5:
                 self._simulated_low_streak = 0
 
         self._simulated_history.append({

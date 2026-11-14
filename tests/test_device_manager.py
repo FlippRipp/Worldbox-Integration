@@ -198,7 +198,8 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
     await run_ticks(manager, clock, 20)
     assert len(pclient.patterns) == 2
 
-    # 3. Shaped per-sentence cues apply entry ramp + arc immediately and settle into steady loop if held > 7s
+    # 3. Per-sentence Stage cues emit pure periodic hardware loops (timeSec=0) with ZERO
+    #    mid-sentence settle reloads across slow 15s TTS sentences, and coalesce minor shifts!
     pclient.patterns.clear()
     vibe.set_target(
         76,
@@ -207,25 +208,34 @@ async def test_pattern_stream_client_buffers_smoothly_without_per_tick_spam():
         source="jev:velvet",
         pace=0.55,
     )
-    await run_ticks(manager, clock, 40)  # 2.0s normal sentence reading -> single shaped packet
+    await run_ticks(manager, clock, 300)  # 15 FULL SECONDS of TTS speech -> ONLY 1 packet!
     assert len(pclient.patterns) == 1
-    first_lv, _, _, _ = pclient.patterns[0]
-    assert first_lv[0] < first_lv[25]  # Smooth entry ramp from previous 50% up toward rising 76%
+    first_lv, _, first_loop, _ = pclient.patterns[0]
+    assert first_loop is True
+    max_int = max(abs(first_lv[i + 1] - first_lv[i]) for i in range(len(first_lv) - 1))
+    assert abs(first_lv[0] - first_lv[-1]) <= max_int + 0.03  # Immediately loop-periodic on packet #1!
 
-    # Next sentence cue (even subtle change with 'ease' arc) updates immediately without 4.5% deadband skip
+    # Next sentence cue within deadband (< 13% shift on same pattern) leaves hardware loop untouched!
     vibe.set_target(
-        74,
+        68,
         "velvet",
-        {"sentence_cue": True, "cue_id": 2, "arc": "ease", "duration_s": 2.8},
+        {"sentence_cue": True, "cue_id": 2, "arc": "ease", "duration_s": 8.0},
         source="jev:velvet",
         pace=0.50,
     )
-    await run_ticks(manager, clock, 20)  # 1.0s
-    assert len(pclient.patterns) == 2
+    await run_ticks(manager, clock, 240)  # Another 12s TTS sentence -> STILL 1 packet!
+    assert len(pclient.patterns) == 1
 
-    # Holding on Sentence 2 for 12s settles once into a pure steady loop and never spams again
-    await run_ticks(manager, clock, 240)
-    assert len(pclient.patterns) == 3
+    # Meaningful intensity jump (>= 13%) updates the hardware loop once cleanly
+    vibe.set_target(
+        92,
+        "velvet",
+        {"sentence_cue": True, "cue_id": 3, "arc": "surge", "duration_s": 7.0},
+        source="jev:velvet",
+        pace=0.55,
+    )
+    await run_ticks(manager, clock, 200)
+    assert len(pclient.patterns) == 2
 
     # 4. Seamless handoff between different patterns (Velvet -> Ocean Swell -> Heartbeat)
     # bridges from live hardware level without starting on a 0% gap, and minor same-pattern
@@ -295,7 +305,7 @@ async def test_live_story_stream_crossfades_nonzero_patterns_and_rise_arcs_with_
             sent_bodies.append(json.loads(req.content))
             return httpx.Response(200, json={"code": 200, "data": {}})
 
-        lov_cfg = {"enabled": True, "host": "127.0.0.1", "port": 20010, "story_drive_mode": "stream"}
+        lov_cfg = {"enabled": True, "host": "127.0.0.1", "port": 20010, "story_drive_mode": "live_stream"}
         lov = lc_mod.LovenseClient(lambda: lov_cfg, transport=httpx.MockTransport(handler), clock=clock)
         vibe = pat_mod.VibeState(clock=clock)
         cfg = dict(CONFIG, lovense=lov_cfg)
@@ -344,6 +354,53 @@ async def test_live_story_stream_crossfades_nonzero_patterns_and_rise_arcs_with_
         assert all(b["stopPrevious"] == 0 and b["timeSec"] == 0 for b in sent_bodies)
         steps = [int(b["action"].split(":")[1]) for b in sent_bodies]
         assert min(steps) >= 4  # Never drops near 0 anywhere across all pattern transitions!
+    finally:
+        pat_mod.set_user_patterns_provider(None)
+
+
+async def test_long_tts_sentences_and_custom_afterglow_loop_forever_without_expiring():
+    import json
+    import httpx
+    import toylink.device_manager as dm_mod
+    import toylink.lovense_client as lc_mod
+    import toylink.patterns as pat_mod
+
+    custom_afterglow = {
+        "afterglow": {
+            "id": "afterglow",
+            "label": "Afterglow",
+            "loop_seconds": 6.5,
+            "default_pace": 0.25,
+            "blocks": [{"type": "wave", "width": 1.0, "repeat": 2, "floor": 0.26, "peak": 0.85, "skew": 0.5, "bend": 0.0}],
+        }
+    }
+    pat_mod.set_user_patterns_provider(lambda: custom_afterglow)
+    try:
+        clock = FakeClock()
+        sent_bodies = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            sent_bodies.append(json.loads(req.content))
+            return httpx.Response(200, json={"code": 200, "data": {}})
+
+        # Default story_drive_mode ("loop") uses infinite hardware Pattern loops (timeSec=0)
+        lov_cfg = {"enabled": True, "host": "127.0.0.1", "port": 20010}
+        lov = lc_mod.LovenseClient(lambda: lov_cfg, transport=httpx.MockTransport(handler), clock=clock)
+        vibe = pat_mod.VibeState(clock=clock)
+        cfg = dict(CONFIG, lovense=lov_cfg)
+        manager = dm_mod.DeviceManager(vibe, [lov], lambda: cfg, clock=clock)
+
+        vibe.set_target(42, "afterglow", {"sentence_cue": True, "cue_id": 1, "arc": "ease", "duration_s": 12.0})
+        await run_ticks(manager, clock, 500)  # 25 FULL SECONDS (> 2.5x old 9.5s afterglow decay!)
+
+        # Sent ONCE with timeSec=0 (infinite hardware loop), zero Stop packets, strength stays 42%!
+        assert len(sent_bodies) == 1
+        assert sent_bodies[0]["command"] == "Pattern"
+        assert sent_bodies[0]["timeSec"] == 0
+        assert vibe.strength == pytest.approx(42.0)
+        assert manager.envelope >= 40.0
+        steps = [int(s) for s in sent_bodies[0]["strength"].split(";")]
+        assert min(steps) >= 2
     finally:
         pat_mod.set_user_patterns_provider(None)
 

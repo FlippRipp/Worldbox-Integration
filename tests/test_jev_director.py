@@ -294,3 +294,46 @@ def test_pattern_continuity_hysteresis_prevents_marginal_flip_flopping():
     assert v_switch["pattern"] == "rhythm"
 
 
+def test_mid_scene_dialogue_streak_holds_simmer_floor_across_three_tts_sentences():
+    # Simulate 3 spoken dialogue lines in a row during an active scene (no touch words, low wind_down)
+    strength = 45.0
+    pat = "velvet"
+    pace = 0.45
+    for streak in range(3):
+        v = interpret_answers(
+            make_answers(engaged=0.10, wind_down=0.05),
+            enabled_patterns=list(PATTERNS),
+            current_strength=strength,
+            current_pattern=pat,
+            current_pace=pace,
+            sentence_mode=True,
+            low_engagement_streak=streak,
+        )
+        assert v["action"] == "apply"
+        assert v["continuity_hold"] is True
+        assert v["strength"] >= 20.0
+        strength = v["strength"]
+
+    # Breathy wind-down beat in sentence_mode marks afterglow for infinite looping (no 9.5s cutoff)
+    v_ag = interpret_answers(
+        make_answers(engaged=0.18, wind_down=0.65),
+        enabled_patterns=list(PATTERNS),
+        current_strength=40.0,
+        current_pattern="velvet",
+        sentence_mode=True,
+    )
+    assert v_ag["pattern"] == "afterglow"
+    assert v_ag.get("params", {}).get("loop_afterglow") is True
+
+    # Sustained non-engagement across 4+ prior sentences cleanly steps down to 0%
+    v_stop = interpret_answers(
+        make_answers(engaged=0.08, wind_down=0.10),
+        enabled_patterns=list(PATTERNS),
+        current_strength=22.0,
+        current_pattern="velvet",
+        sentence_mode=True,
+        low_engagement_streak=4,
+    )
+    assert v_stop["strength"] == 0.0
+
+

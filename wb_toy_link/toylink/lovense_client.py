@@ -96,6 +96,7 @@ class LovenseClient:
         self._hw_mode: str = "idle"  # "idle" | "function" | "pattern"
         self._last_step: int = 0
         self._last_send_at: float = 0.0
+        self._last_dispatch_at: float = -999.0
         self._sending: bool = False
         self._pending_op: tuple | None = None
 
@@ -108,8 +109,8 @@ class LovenseClient:
 
     @property
     def prefers_live_story_stream(self) -> bool:
-        mode = str(self._cfg().get("story_drive_mode", "stream") or "stream").strip().lower()
-        return mode != "pattern"
+        mode = str(self._cfg().get("story_drive_mode", "loop") or "loop").strip().lower()
+        return mode == "live_stream"
 
     @property
     def enabled(self) -> bool:
@@ -329,14 +330,14 @@ class LovenseClient:
         if step == self._last_step and self._hw_mode == "function" and self.connected:
             return
 
-        # Pace positive step transitions to BLE's 110ms slot; DeviceManager's 20Hz
-        # ticker automatically delivers the newest step on the next eligible tick.
+        # Pace positive step transitions to BLE's 110ms slot from dispatch timestamp
+        # so in-flight LAN requests never burst back-to-back and return-ACK jitter doesn't starve ticks.
         if (
             step > 0
-            and self._last_step > 0
-            and self._hw_mode == "function"
-            and (now - self._last_send_at) < LIVE_STEP_INTERVAL_S
-            and self.connected
+            and (self._last_step > 0 or self._sending)
+            and (self._hw_mode == "function" or self._sending)
+            and (now - self._last_dispatch_at) < LIVE_STEP_INTERVAL_S
+            and (self.connected or self._sending)
         ):
             return
 
@@ -379,6 +380,7 @@ class LovenseClient:
         self._pending_op = None
         self._last_step = 0
         self._last_send_at = 0.0
+        self._last_dispatch_at = -999.0
         self._hw_mode = "idle"
         if not self.enabled:
             return
@@ -410,8 +412,11 @@ class LovenseClient:
                     self._hw_mode = "idle"
                     self._last_step = 0
                     self._last_send_at = 0.0
+                    self._last_dispatch_at = -999.0
                 elif kind in ("function", "live_function"):
                     _, payload, step = cur
+                    if kind == "live_function":
+                        self._last_dispatch_at = self._clock()
                     ok = await self._post(payload)
                     if ok is not None:
                         self._hw_mode = "function"
@@ -455,7 +460,7 @@ class LovenseClient:
             "https": https,
             "connected": self.connected,
             "mode": "pattern" if self.supports_pattern_stream else "function",
-            "story_drive_mode": "stream" if self.prefers_live_story_stream else "pattern",
+            "story_drive_mode": "live_stream" if self.prefers_live_story_stream else "loop",
             "rtt_ms": round(self.last_rtt_s * 1000.0, 1),
             "devices": list(self.toys),
             "last_error": self.last_error,

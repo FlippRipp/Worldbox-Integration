@@ -225,4 +225,44 @@ async def test_send_live_level_uses_stop_previous_zero_and_paces_ble_slots():
     await client.send_live_level(0.70)
     assert requests[-1]["stopPrevious"] == 0
 
+    # Concurrent tick arriving <110ms while an HTTP POST is still in-flight is coalesced
+    # against _last_dispatch_at instead of queueing a 0ms back-to-back BLE burst!
+    import asyncio
+    import httpx
+    from toylink.lovense_client import LovenseClient
+
+    release_first = asyncio.Event()
+    slow_reqs = []
+
+    class SlowAsyncTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            import json
+            slow_reqs.append(json.loads(request.content))
+            if len(slow_reqs) == 1:
+                await release_first.wait()
+            return httpx.Response(200, json={"code": 200, "data": {}})
+
+    slow_clock = FakeClock()
+    slow_client = LovenseClient(
+        lambda: {"enabled": True, "host": "127.0.0.1", "port": 20010, "story_drive_mode": "live_stream"},
+        transport=SlowAsyncTransport(),
+        clock=slow_clock,
+    )
+    t1 = asyncio.create_task(slow_client.send_live_level(0.55))
+    await asyncio.sleep(0)
+    assert len(slow_reqs) == 1
+
+    # 50ms later while Request #1 is still in-flight: must NOT queue a burst packet!
+    slow_clock.t += 0.05
+    await slow_client.send_live_level(0.75)
+    release_first.set()
+    await t1
+    assert len(slow_reqs) == 1
+
+    # Next tick >=110ms after dispatch sends cleanly
+    slow_clock.t += 0.07
+    await slow_client.send_live_level(0.80)
+    assert len(slow_reqs) == 2
+    assert slow_reqs[-1]["action"] == "All:16"
+
 
